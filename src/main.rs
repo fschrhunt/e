@@ -178,13 +178,15 @@ impl App {
                 lines.push(String::new());
                 if s.turn.phase == TurnPhase::Thinking {
                     // The reference runs the activity dot on the same column
-                    // as the user rail — flush left, no indent.
-                    let marker = if blink_on {
-                        self.theme.fg("userMessageText", "•")
+                    // as the user rail — flush left, no indent. The blink is
+                    // presence, not color: the dot shows and hides, no dim
+                    // half-state between.
+                    let line = if blink_on {
+                        format!("{} {label}", self.theme.fg("userMessageText", "•"))
                     } else {
-                        self.theme.fg("dim", "•")
+                        format!("  {label}")
                     };
-                    lines.push(format!("{marker} {label}"));
+                    lines.push(line);
                 } else {
                     lines.push(label);
                 }
@@ -1090,7 +1092,7 @@ impl App {
                 }
             }
             SessionEvent::Retry { attempt, message } => {
-                self.notice(format!("retrying ({attempt}/2): {message}"));
+                self.notice(format!("retrying ({attempt}/2): {message} — esc to cancel"));
             }
             SessionEvent::Error(message) => {
                 if let Some(s) = &mut self.active {
@@ -1138,7 +1140,10 @@ impl App {
                     ));
                 }
                 if let Some(message) = s.error {
-                    self.notice(format!("error: {message}"));
+                    // A failed turn ends visibly: the error persists in error
+                    // color below the trailer, never a vanishing status blip.
+                    self.transcript
+                        .push(Block::new(Kind::Error, format!("error: {message}")));
                 }
                 // Compaction runs between turns, never during one: a deferred
                 // /compact fires here, and so does the auto threshold check

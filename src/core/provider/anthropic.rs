@@ -5,12 +5,11 @@
 //! tool_use input JSON; message_start/message_delta carry usage. Effort maps
 //! to an extended-thinking token budget.
 
-use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::core::auth::{self, Credential};
-use crate::core::provider::{http, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Output ceiling per reply; every cataloged model allows at least this.
@@ -137,13 +136,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
     let mut cache_read = 0u64;
     let mut output_tokens = 0u64;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            (
-                format!("stream failed: {e}"),
-                crate::core::provider::ErrorKind::Delivered,
-            )
-        })?;
+    while let Some(chunk) = next_sse_chunk(&mut stream).await? {
         for payload in splitter.feed(&String::from_utf8_lossy(&chunk)) {
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
                 continue;
@@ -221,5 +214,8 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
             }
         }
     }
-    Ok(())
+    Err((
+        "stream ended unexpectedly".into(),
+        crate::core::provider::ErrorKind::Delivered,
+    ))
 }

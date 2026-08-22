@@ -2,13 +2,12 @@
 //! SSE deltas at `choices[0].delta`, streamed tool-call argument fragments
 //! accumulated by index, a final usage frame, `[DONE]` sentinel.
 
-use futures::StreamExt;
 use serde_json::json;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 use crate::core::auth::{self, Credential};
-use crate::core::provider::{http, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
 
 type RunError = (String, crate::core::provider::ErrorKind);
 
@@ -123,13 +122,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
 
     let mut splitter = SseSplitter::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            (
-                format!("stream error: {e}"),
-                crate::core::provider::ErrorKind::Delivered,
-            )
-        })?;
+    while let Some(chunk) = next_sse_chunk(&mut stream).await? {
         for payload in splitter.feed(&String::from_utf8_lossy(&chunk)) {
             if payload == "[DONE]" {
                 flush(&mut pending, tx).await;
@@ -190,6 +183,9 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
             }
         }
     }
-    flush(&mut pending, tx).await;
-    Ok(())
+    // EOF without [DONE] is a broken stream, not a successful empty reply.
+    Err((
+        "stream ended unexpectedly".into(),
+        crate::core::provider::ErrorKind::Delivered,
+    ))
 }

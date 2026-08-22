@@ -30,6 +30,13 @@
   language-neutral line protocol is on the roadmap.
 - `/reload` replaces its `reloading…` notice with the completion text instead
   of appending a second transcript line.
+- Turn endings hold: a stalled or broken provider stream no longer leaves the
+  spinner running with Esc inert (cancel is checked while waiting on SSE, not
+  only after the next byte); quiet sockets fail after 180s and incomplete EOF
+  is an error, not a silent success; a failed turn closes with its error
+  persisted in the transcript in error color below the duration trailer; retry
+  notices carry an esc-to-cancel hint; and the thinking dot blinks presence —
+  visible then hidden, no dim half-state.
 - Repo-local resources: a trusted directory's `.e/skills/` and
   `.e/prompts/` load beside the global ones (same formats, same trust gate
   as AGENTS.md); a repo resource shadows a global of the same name.

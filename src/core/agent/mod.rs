@@ -12,6 +12,7 @@ pub mod context;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -48,6 +49,15 @@ fn clone_request(r: &Request) -> Request {
         messages: r.messages.clone(),
         effort: r.effort.clone(),
         tools: r.tools.clone(),
+    }
+}
+
+/// Resolve when Esc (or any interrupt) has been requested. Polled on a short
+/// interval so a stalled provider stream — which never yields another event —
+/// cannot strand the turn with `running` stuck true and Esc inert.
+async fn wait_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -322,11 +332,21 @@ impl Agent {
                 let mut calls: Vec<ToolCall> = Vec::new();
                 let mut reasoning_items: Vec<String> = Vec::new();
                 let mut errored = false;
-                'stream: while let Some(event) = rx.recv().await {
-                    if cancel.load(Ordering::SeqCst) {
-                        handle.abort();
-                        break 'turn true;
-                    }
+                // Cancel must win even when the provider yields nothing: a
+                // prior `while let Some(event) = rx.recv()` only checked Esc
+                // after the next byte arrived, so a stalled SSE left the
+                // spinner running and Esc inert until the socket moved.
+                'stream: loop {
+                    let event = tokio::select! {
+                        event = rx.recv() => event,
+                        _ = wait_cancelled(&cancel) => {
+                            handle.abort();
+                            break 'turn true;
+                        }
+                    };
+                    let Some(event) = event else {
+                        break 'stream;
+                    };
                     match event {
                         ProviderEvent::TextDelta(d) => {
                             text.push_str(&d);
@@ -371,6 +391,10 @@ impl Agent {
                                     })
                                     .await;
                                 tokio::time::sleep(backoff).await;
+                                if cancel.load(Ordering::SeqCst) {
+                                    handle.abort();
+                                    break 'turn true;
+                                }
                                 let (nrx, nhandle) = provider::stream(clone_request(&request));
                                 rx = nrx;
                                 handle = nhandle;

@@ -229,13 +229,43 @@ fn skip_separator(buf: &str, pos: usize) -> usize {
 }
 
 /// The shared client: one pool for every request, so connections (and their
-/// TLS handshakes) are reused across turns and tool steps.
+/// TLS handshakes) are reused across turns and tool steps. Connect is bounded;
+/// the overall request is not — a live SSE stream can run for minutes. Idle
+/// stalls are caught per-chunk in `next_sse_chunk`.
 pub fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .user_agent(format!("e/{}", crate::VERSION))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("http client")
     })
+}
+
+/// Seconds without a byte before a live SSE body is declared stalled.
+pub const STREAM_IDLE_SECS: u64 = 180;
+
+/// Await the next SSE body chunk. An idle socket fails instead of hanging the
+/// turn forever — the agent then ends with a visible error rather than a
+/// spinner that Esc cannot clear.
+pub async fn next_sse_chunk<S, T, E>(stream: &mut S) -> Result<Option<T>, (String, ErrorKind)>
+where
+    S: futures::Stream<Item = Result<T, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(STREAM_IDLE_SECS),
+        futures::StreamExt::next(stream),
+    )
+    .await
+    {
+        Ok(None) => Ok(None),
+        Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+        Ok(Some(Err(e))) => Err((format!("stream error: {e}"), ErrorKind::Delivered)),
+        Err(_) => Err((
+            format!("stream stalled — no data for {STREAM_IDLE_SECS}s"),
+            ErrorKind::Delivered,
+        )),
+    }
 }

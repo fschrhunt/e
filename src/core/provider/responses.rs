@@ -6,12 +6,11 @@
 //! `{base}/responses` behind a plain key. The provider id — not this module —
 //! names the account type.
 
-use futures::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::core::auth::{self, Credential};
-use crate::core::provider::{http, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const AUTH_BASE: &str = "https://auth.openai.com";
@@ -197,13 +196,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
     let mut stream = response.bytes_stream();
     // function_call items accumulate argument deltas keyed by item id.
     let mut pending: std::collections::BTreeMap<String, ToolCall> = Default::default();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            (
-                format!("stream error: {e}"),
-                crate::core::provider::ErrorKind::Delivered,
-            )
-        })?;
+    while let Some(chunk) = next_sse_chunk(&mut stream).await? {
         for payload in splitter.feed(&String::from_utf8_lossy(&chunk)) {
             if payload == "[DONE]" {
                 return Ok(());
@@ -310,5 +303,8 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
             }
         }
     }
-    Ok(())
+    Err((
+        "stream ended unexpectedly".into(),
+        crate::core::provider::ErrorKind::Delivered,
+    ))
 }
