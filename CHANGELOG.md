@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Structure: `tui/` is grouped into `paint/` (SGR, screen, theme), `content/`
+  (markdown, transcript, composer, statusline), `surfaces/` (footer panels),
+  and `app/` (the interactive frame loop, moved out of `main.rs`). Short
+  paths (`tui::theme`, …) still re-export. Provider dialects share one
+  `Api::parse` and pull OAuth refresh from `auth::login` instead of inlining it.
 - Composer typing feel: drafts word-wrap (a word that crosses the edge
   comes down whole instead of tearing mid-letter); ↑/↓ move between wrapped
   or multi-line rows, falling back to history recall at the edges; and the

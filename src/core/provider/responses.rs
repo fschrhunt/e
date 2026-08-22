@@ -4,75 +4,13 @@
 //! `{base}/codex/responses` behind a subscription OAuth (bearer + account-id
 //! header, lazy refresh); other providers serve the same event grammar at
 //! `{base}/responses` behind a plain key. The provider id — not this module —
-//! names the account type.
+//! names the account type. OAuth refresh lives in `auth::login`.
 
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::core::auth::{self, Credential};
+use crate::core::auth::{self, login, Credential};
 use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
-
-pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-pub const AUTH_BASE: &str = "https://auth.openai.com";
-
-/// Refresh when within a minute of expiry; persist the rotated pair.
-async fn fresh_access(provider: &str) -> Result<(String, String), String> {
-    let Some(Credential::OAuth {
-        access,
-        refresh,
-        expires,
-        account_id,
-    }) = auth::load().get(provider).cloned()
-    else {
-        return Err(format!(
-            "no OAuth credentials for {provider} — run `e auth {provider}`"
-        ));
-    };
-    let account = account_id
-        .or_else(|| auth::account_id_from_jwt(&access))
-        .ok_or("credentials carry no account id")?;
-
-    if auth::now_ms() + 60_000 < expires {
-        return Ok((access, account));
-    }
-
-    let response = http()
-        .post(format!("{AUTH_BASE}/oauth/token"))
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh.as_str()),
-            ("client_id", CLIENT_ID),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("token refresh failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        return Err(format!(
-            "token refresh rejected ({status}) — run `e auth {provider}` again"
-        ));
-    }
-    let tokens: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    let (Some(access), Some(refresh), Some(expires_in)) = (
-        tokens["access_token"].as_str(),
-        tokens["refresh_token"].as_str(),
-        tokens["expires_in"].as_u64(),
-    ) else {
-        return Err("token refresh response missing fields".into());
-    };
-    let account = auth::account_id_from_jwt(access).unwrap_or(account);
-    auth::set(
-        provider,
-        Credential::OAuth {
-            access: access.to_string(),
-            refresh: refresh.to_string(),
-            expires: auth::now_ms() + expires_in * 1000,
-            account_id: Some(account.clone()),
-        },
-    )
-    .map_err(|e| e.to_string())?;
-    Ok((access.to_string(), account))
-}
 
 type RunError = (String, crate::core::provider::ErrorKind);
 
@@ -83,7 +21,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
     let (access, account) = match auth::load().get(request.model.provider.as_str()) {
         Some(Credential::ApiKey { key }) => (key.clone(), None),
         _ => {
-            let (access, account) = fresh_access(&request.model.provider)
+            let (access, account) = login::codex_access(&request.model.provider)
                 .await
                 .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
             (access, Some(account))

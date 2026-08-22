@@ -1,8 +1,9 @@
 //! The provider seam: one request contract, one normalized event stream.
 //!
 //! Everything above this module sees `Event`s; everything below is a wire
-//! dialect. Two dialects ship: the chat-completions family and the
-//! Responses-API family (see `completions.rs` / `responses.rs`).
+//! dialect. Three dialects ship: chat-completions, Responses-API, and
+//! Anthropic Messages (see `completions.rs` / `responses.rs` / `anthropic.rs`).
+//! Providers are data (`providers/*.json`); OAuth refresh lives in `auth::login`.
 //! SSE framing is handled here — one small splitter, tested, shared.
 
 pub mod anthropic;

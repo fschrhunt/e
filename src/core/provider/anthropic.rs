@@ -8,7 +8,7 @@
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::core::auth::{self, Credential};
+use crate::core::auth::login;
 use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -27,17 +27,9 @@ fn thinking_budget(effort: &str) -> u64 {
 type RunError = (String, crate::core::provider::ErrorKind);
 
 pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunError> {
-    let auth = auth::load();
-    let key = match auth.get(request.model.provider.as_str()) {
-        Some(Credential::ApiKey { key }) => key.clone(),
-        Some(Credential::OAuth { access, .. }) => access.clone(),
-        None => {
-            return Err((
-                format!("no credentials for {} — run /login", request.model.provider),
-                crate::core::provider::ErrorKind::Auth,
-            ))
-        }
-    };
+    let key = login::access_token(request.model.provider.as_str())
+        .await
+        .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
 
     // History → content blocks. Tool results ride user turns.
     let mut messages: Vec<serde_json::Value> = Vec::new();

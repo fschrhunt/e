@@ -6,43 +6,15 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
-use crate::core::auth::{self, Credential};
+use crate::core::auth::login;
 use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
 
 type RunError = (String, crate::core::provider::ErrorKind);
 
 pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunError> {
-    let auth = auth::load();
-    let key = match auth.get(request.model.provider.as_str()) {
-        Some(Credential::ApiKey { key }) => key.clone(),
-        Some(Credential::OAuth {
-            access,
-            refresh,
-            expires,
-            ..
-        }) => {
-            // The only OAuth provider on this dialect is xAI; refresh lazily
-            // when the access token is within a minute of expiry.
-            if auth::now_ms() + 60_000 < *expires {
-                access.clone()
-            } else {
-                let fresh = crate::core::auth::login::xai_refresh(refresh)
-                    .await
-                    .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
-                let _ = auth::set(&request.model.provider, fresh.clone());
-                match fresh {
-                    Credential::OAuth { access, .. } => access,
-                    Credential::ApiKey { key } => key,
-                }
-            }
-        }
-        None => {
-            return Err((
-                format!("no credentials for {} — run /login", request.model.provider),
-                crate::core::provider::ErrorKind::Auth,
-            ))
-        }
-    };
+    let key = login::access_token(request.model.provider.as_str())
+        .await
+        .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
 
     let mut messages = vec![json!({"role": "system", "content": request.system})];
     for m in &request.messages {
