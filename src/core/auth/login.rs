@@ -18,6 +18,11 @@ pub const AUTH_BASE: &str = "https://auth.openai.com";
 
 const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 
+/// Bound on turn-path token refreshes (whole request — they return small
+/// JSON, never a stream). Interactive login flows stay unbounded: the user
+/// is present and can abort them.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -415,6 +420,9 @@ pub async fn xai_refresh(refresh: &str) -> Result<crate::core::auth::Credential,
             ("client_id", XAI_CLIENT_ID),
             ("refresh_token", refresh),
         ])
+        // Refreshes run on the turn path: a hung token endpoint must fail
+        // the turn, not park it before the provider request even starts.
+        .timeout(REFRESH_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("xAI token refresh failed: {e}"))?;
@@ -460,6 +468,9 @@ pub async fn codex_access(provider: &str) -> Result<(String, String), String> {
             ("refresh_token", refresh.as_str()),
             ("client_id", CLIENT_ID),
         ])
+        // Refreshes run on the turn path: a hung token endpoint must fail
+        // the turn, not park it before the provider request even starts.
+        .timeout(REFRESH_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("token refresh failed: {e}"))?;

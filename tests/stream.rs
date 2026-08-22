@@ -320,3 +320,87 @@ async fn unexpected_eof_is_an_error_not_a_silent_done() {
         "unexpected EOF wording missing: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unanswered_request_fails_instead_of_hanging() {
+    use e::core::provider::{http, send_request_within, ErrorKind};
+    use std::time::Duration;
+
+    // The gap between connect (client-bounded) and body reads (chunk-bounded):
+    // the server accepts the request and never sends response headers.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 8192];
+        let _ = sock.read(&mut buffer);
+        std::thread::sleep(Duration::from_secs(30));
+    });
+
+    let builder = http()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .body("{}");
+    let (message, kind) = send_request_within(builder, Duration::from_millis(300))
+        .await
+        .expect_err("headers never arrive — the send must time out");
+    assert!(
+        message.contains("no response"),
+        "stall wording missing: {message}"
+    );
+    // Written but unanswered: may have been delivered, so never auto-retried.
+    assert_eq!(kind, ErrorKind::Delivered);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_interrupt_ends_a_turn_stuck_before_headers() {
+    use e::core::agent::{Agent, SessionEvent};
+    use std::time::Duration;
+
+    // Same shape as the stalled-body pin, one await point earlier: the
+    // provider task is parked inside send(), not the body stream. Esc must
+    // end the turn just the same.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let home = std::env::temp_dir().join(format!("e-test-agent-headers-{port}"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("auth.json"), r#"{"mock":{"key":"k"}}"#).unwrap();
+    std::env::set_var("E_HOME", &home);
+
+    std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        let mut buffer = [0u8; 8192];
+        let _ = sock.read(&mut buffer);
+        std::thread::sleep(Duration::from_secs(30));
+    });
+
+    let model = Model {
+        provider: "mock".into(),
+        id: "m".into(),
+        base_url: format!("http://127.0.0.1:{port}"),
+        api: Api::Completions,
+        efforts: Vec::new(),
+        context_window: 200_000,
+    };
+    let (mut agent, mut rx) = Agent::new(model);
+    agent.submit("hi".into(), "sys".into());
+
+    while let Some(event) = rx.recv().await {
+        if matches!(event, SessionEvent::TurnStart) {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    agent.interrupt();
+
+    let aborted = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(event) = rx.recv().await {
+            if let SessionEvent::TurnEnd { aborted } = event {
+                return aborted;
+            }
+        }
+        panic!("turn ended without TurnEnd");
+    })
+    .await
+    .expect("interrupt must end a pre-headers stall promptly");
+    assert!(aborted, "pre-headers interrupt should abort the turn");
+}

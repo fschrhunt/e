@@ -10,7 +10,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::core::auth::{self, login, Credential};
-use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{
+    http, next_sse_chunk, send_request, Event, Request, SseSplitter, ToolCall,
+};
 
 type RunError = (String, crate::core::provider::ErrorKind);
 
@@ -114,12 +116,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
     builder = builder
         .bearer_auth(&access)
         .header("accept", "text/event-stream");
-    let response = builder.json(&body).send().await.map_err(|e| {
-        (
-            format!("request failed: {e}"),
-            crate::core::provider::ErrorKind::Transient,
-        )
-    })?;
+    let response = send_request(builder.json(&body)).await?;
 
     if !response.status().is_success() {
         let status = response.status();

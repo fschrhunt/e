@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The last silent-stall window is closed: the wait for response headers is
+  bounded by the same budget as the stream body (a provider that accepts the
+  request but never answers now fails the turn visibly), and turn-path token
+  refreshes carry a request timeout so a hung token endpoint cannot park a
+  turn before the provider request even starts.
 - Structure: `tui/` is grouped into `paint/` (SGR, screen, theme), `content/`
   (markdown, transcript, composer, statusline), `surfaces/` (footer panels),
   and `app/` (the interactive frame loop, moved out of `main.rs`). Short

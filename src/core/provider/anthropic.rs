@@ -9,7 +9,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::core::auth::login;
-use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{
+    http, next_sse_chunk, send_request, Event, Request, SseSplitter, ToolCall,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Output ceiling per reply; every cataloged model allows at least this.
@@ -96,20 +98,15 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
         });
     }
 
-    let response = http()
-        .post(format!("{}/v1/messages", request.model.base_url))
-        .header("x-api-key", &key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                format!("request failed: {e}"),
-                crate::core::provider::ErrorKind::Transient,
-            )
-        })?;
+    let response = send_request(
+        http()
+            .post(format!("{}/v1/messages", request.model.base_url))
+            .header("x-api-key", &key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("accept", "text/event-stream")
+            .json(&body),
+    )
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();

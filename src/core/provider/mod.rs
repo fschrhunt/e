@@ -231,8 +231,9 @@ fn skip_separator(buf: &str, pos: usize) -> usize {
 
 /// The shared client: one pool for every request, so connections (and their
 /// TLS handshakes) are reused across turns and tool steps. Connect is bounded;
-/// the overall request is not — a live SSE stream can run for minutes. Idle
-/// stalls are caught per-chunk in `next_sse_chunk`.
+/// the overall request is not — a live SSE stream can run for minutes. The
+/// wait for response headers is bounded in `send_request`, idle bodies
+/// per-chunk in `next_sse_chunk`.
 pub fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -244,8 +245,37 @@ pub fn http() -> &'static reqwest::Client {
     })
 }
 
-/// Seconds without a byte before a live SSE body is declared stalled.
+/// Seconds of provider silence — awaiting response headers or the next body
+/// chunk — before the request is declared stalled.
 pub const STREAM_IDLE_SECS: u64 = 180;
+
+/// Send the request, bounding the wait for response headers. The client
+/// bounds connect and `next_sse_chunk` bounds body reads; this closes the gap
+/// between them — an accepted request the provider never answers — with the
+/// same budget: silence is a stall wherever it happens.
+pub async fn send_request(
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, (String, ErrorKind)> {
+    send_request_within(builder, std::time::Duration::from_secs(STREAM_IDLE_SECS)).await
+}
+
+/// `send_request` with an explicit bound (tests shrink it to milliseconds).
+pub async fn send_request_within(
+    builder: reqwest::RequestBuilder,
+    wait: std::time::Duration,
+) -> Result<reqwest::Response, (String, ErrorKind)> {
+    match tokio::time::timeout(wait, builder.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        // Connection and setup failures: the request never left, retryable.
+        Ok(Err(e)) => Err((format!("request failed: {e}"), ErrorKind::Transient)),
+        // The request was written but never answered — it may have been
+        // delivered, so a retry could double-bill.
+        Err(_) => Err((
+            format!("no response from provider for {}s", wait.as_secs()),
+            ErrorKind::Delivered,
+        )),
+    }
+}
 
 /// Await the next SSE body chunk. An idle socket fails instead of hanging the
 /// turn forever — the agent then ends with a visible error rather than a

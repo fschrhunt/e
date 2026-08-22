@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use tokio::sync::mpsc;
 
 use crate::core::auth::login;
-use crate::core::provider::{http, next_sse_chunk, Event, Request, SseSplitter, ToolCall};
+use crate::core::provider::{
+    http, next_sse_chunk, send_request, Event, Request, SseSplitter, ToolCall,
+};
 
 type RunError = (String, crate::core::provider::ErrorKind);
 
@@ -55,19 +57,14 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
         body["tools"] = json!(request.tools);
     }
 
-    let response = http()
-        .post(format!("{}/chat/completions", request.model.base_url))
-        .bearer_auth(&key)
-        .header("accept", "text/event-stream")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                format!("request failed: {e}"),
-                crate::core::provider::ErrorKind::Transient,
-            )
-        })?;
+    let response = send_request(
+        http()
+            .post(format!("{}/chat/completions", request.model.base_url))
+            .bearer_auth(&key)
+            .header("accept", "text/event-stream")
+            .json(&body),
+    )
+    .await?;
 
     if !response.status().is_success() {
         let status = response.status();
