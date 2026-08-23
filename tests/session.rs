@@ -189,7 +189,9 @@ fn legacy_session_directories_are_filtered_by_header_cwd() {
     let _ = std::fs::remove_dir_all(home);
 }
 
-#[cfg(unix)]
+// Linux filesystems accept arbitrary non-NUL filename bytes. macOS rejects
+// this deliberately invalid UTF-8 test fixture with EILSEQ.
+#[cfg(target_os = "linux")]
 #[test]
 fn session_keys_preserve_non_utf8_path_bytes() {
     use std::os::unix::ffi::OsStringExt;
