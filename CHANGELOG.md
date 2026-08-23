@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Retries now show their work instead of a scrollback notice: a retryable
+  failure (429/408/5xx, a network drop, a stalled request, or a provider
+  error frame naming an outage or rate limit) replaces the Thinking row in
+  place with the cause, a short reason, the backoff, and an attempt count
+  (`Provider unavailable · 503 Service Unavailable · retrying in 4s ·
+  attempt 3/10`), toned as a warning; the first content after a retry flashes
+  a brief `✓ Recovered` before reverting. Backoff follows the reference
+  client's shape — 250ms, 1s, 2s, 4s, 8s, 16s, then flat at a 30s ceiling —
+  for up to 10 attempts before the turn fails with how long it tried.
+  `Retry-After` is honored (capped at the same ceiling) when a provider
+  sends one. Esc now cancels a retry wait immediately rather than after the
+  full backoff, and every non-2xx status is classified by what it means for
+  retrying (`FailureCause`) instead of the old binary Auth/Transient/Delivered
+  split that only ever retried a bare connection failure.
 - The last silent-stall window is closed: the wait for response headers is
   bounded by the same budget as the stream body (a provider that accepts the
   request but never answers now fails the turn visibly), and turn-path token

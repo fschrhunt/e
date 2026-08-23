@@ -20,7 +20,9 @@ use crate::tui::authpanel::{self, AuthStage};
 use crate::tui::composer::{Editor, EditorResult, Key};
 use crate::tui::menu::{Menu, MenuItem, MenuKind, HINT_SCOPED, HINT_USE};
 use crate::tui::screen::Screen;
-use crate::tui::statusline::{statusline, StatusData, Turn, TurnPhase};
+use crate::tui::statusline::{
+    statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase, RECOVERED_VISIBLE_MS,
+};
 use crate::tui::theme::Theme;
 use crate::tui::transcript::{Block, Kind, Transcript};
 use crate::tui::trustpanel::{self, TrustStage};
@@ -175,7 +177,17 @@ impl App {
         if let Some(s) = &self.active {
             if let Some(label) = s.turn.label(s.started.elapsed().as_secs()) {
                 lines.push(String::new());
-                if s.turn.phase == TurnPhase::Thinking {
+                if s.turn.recovered.is_some() {
+                    // A brief, non-blinking confirmation — not an ongoing
+                    // wait, so no dot animation.
+                    lines.push(self.theme.fg("success", &format!("✓ {label}")));
+                } else if s.turn.phase == TurnPhase::Retrying {
+                    // Same blinking dot as Thinking — still an in-progress
+                    // wait — toned as a warning so a struggling provider
+                    // reads distinctly from ordinary thinking.
+                    let dot = if blink_on { "•" } else { " " };
+                    lines.push(self.theme.fg("warning", &format!("{dot} {label}")));
+                } else if s.turn.phase == TurnPhase::Thinking {
                     // The reference runs the activity dot on the same column
                     // as the user rail — flush left, no indent. The blink is
                     // presence, not color: the dot shows and hides, no dim
@@ -1093,8 +1105,38 @@ impl App {
                     }
                 }
             }
-            SessionEvent::Retry { attempt, message } => {
-                self.notice(format!("retrying ({attempt}/2): {message} — esc to cancel"));
+            SessionEvent::Retry {
+                attempt,
+                limit,
+                delay_secs,
+                cause,
+                reason,
+            } => {
+                // Replaces the Thinking row in place — a live status, not a
+                // scrollback notice: it's transient by nature and would
+                // otherwise leave one permanent line per attempt behind.
+                if let Some(s) = &mut self.active {
+                    s.turn.phase = TurnPhase::Retrying;
+                    s.turn.retry = Some(RetryStatus {
+                        attempt,
+                        limit,
+                        delay_secs,
+                        cause,
+                        reason,
+                    });
+                    s.turn.recovered = None;
+                }
+            }
+            SessionEvent::Recovered { attempt, limit } => {
+                if let Some(s) = &mut self.active {
+                    s.turn.phase = TurnPhase::Thinking;
+                    s.turn.retry = None;
+                    s.turn.recovered = Some(RecoveredStatus {
+                        attempt,
+                        limit,
+                        since: Instant::now(),
+                    });
+                }
             }
             SessionEvent::Error(message) => {
                 if let Some(s) = &mut self.active {
@@ -1934,6 +1976,13 @@ pub async fn run(
                     if at.elapsed() > Duration::from_millis(1600) {
                         app.armed_at = None;
                         app.overlay = None;
+                    }
+                }
+                if let Some(s) = &mut app.active {
+                    let expired = s.turn.recovered
+                        .is_some_and(|r| r.since.elapsed() > Duration::from_millis(RECOVERED_VISIBLE_MS));
+                    if expired {
+                        s.turn.recovered = None;
                     }
                 }
             }

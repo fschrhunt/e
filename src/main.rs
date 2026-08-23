@@ -158,8 +158,20 @@ async fn ask(
                     println!("{}", theme.fg("dim", &format!("└ {summary}")));
                 }
             }
-            SessionEvent::Retry { attempt, message } => {
-                eprintln!("retrying ({attempt}/2): {message}");
+            SessionEvent::Retry {
+                attempt,
+                limit,
+                delay_secs,
+                cause,
+                reason,
+            } => {
+                eprintln!(
+                    "{} — retrying ({attempt}/{limit}) in {delay_secs}s: {reason}",
+                    cause.label()
+                );
+            }
+            SessionEvent::Recovered { attempt, limit } => {
+                eprintln!("recovered on attempt {attempt}/{limit}");
             }
             SessionEvent::Error(message) => {
                 eprintln!("error: {message}");

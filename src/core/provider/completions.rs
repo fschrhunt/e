@@ -8,15 +8,16 @@ use tokio::sync::mpsc;
 
 use crate::core::auth::login;
 use crate::core::provider::{
-    http, next_sse_chunk, send_request, Event, Request, SseSplitter, ToolCall,
+    http, next_sse_chunk, retry_after_seconds, send_request, Event, ProviderError, Request,
+    SseSplitter, ToolCall,
 };
 
-type RunError = (String, crate::core::provider::ErrorKind);
+type RunError = ProviderError;
 
 pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunError> {
     let key = login::access_token(request.model.provider.as_str())
         .await
-        .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
+        .map_err(ProviderError::auth)?;
 
     let mut messages = vec![json!({"role": "system", "content": request.system})];
     for m in &request.messages {
@@ -68,11 +69,9 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
 
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = retry_after_seconds(&response);
         let text = response.text().await.unwrap_or_default();
-        return Err((
-            format!("{status}: {}", text.chars().take(300).collect::<String>()),
-            crate::core::provider::ErrorKind::Delivered,
-        ));
+        return Err(ProviderError::from_status(status, &text).with_retry_after(retry_after));
     }
 
     // Tool-call fragments accumulate per stream index until [DONE].
@@ -153,8 +152,5 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
         }
     }
     // EOF without [DONE] is a broken stream, not a successful empty reply.
-    Err((
-        "stream ended unexpectedly".into(),
-        crate::core::provider::ErrorKind::Delivered,
-    ))
+    Err(ProviderError::stalled("stream ended unexpectedly"))
 }

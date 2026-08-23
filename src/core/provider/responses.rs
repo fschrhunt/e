@@ -11,10 +11,11 @@ use tokio::sync::mpsc;
 
 use crate::core::auth::{self, login, Credential};
 use crate::core::provider::{
-    http, next_sse_chunk, send_request, Event, Request, SseSplitter, ToolCall,
+    http, next_sse_chunk, retry_after_seconds, send_request, Event, FailureCause, ProviderError,
+    Request, SseSplitter, ToolCall,
 };
 
-type RunError = (String, crate::core::provider::ErrorKind);
+type RunError = ProviderError;
 
 pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunError> {
     // A plain API key means the standard platform mount (`{base}/responses`,
@@ -25,7 +26,7 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
         _ => {
             let (access, account) = login::codex_access(&request.model.provider)
                 .await
-                .map_err(|e| (e, crate::core::provider::ErrorKind::Auth))?;
+                .map_err(ProviderError::auth)?;
             (access, Some(account))
         }
     };
@@ -120,11 +121,9 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
 
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = retry_after_seconds(&response);
         let text = response.text().await.unwrap_or_default();
-        return Err((
-            format!("{status}: {}", text.chars().take(300).collect::<String>()),
-            crate::core::provider::ErrorKind::Delivered,
-        ));
+        return Err(ProviderError::from_status(status, &text).with_retry_after(retry_after));
     }
 
     let mut splitter = SseSplitter::new();
@@ -232,14 +231,16 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<(), RunE
                         .as_str()
                         .unwrap_or("response failed")
                         .to_string();
-                    return Err((message, crate::core::provider::ErrorKind::Delivered));
+                    let cause = match value["response"]["error"]["code"].as_str().unwrap_or("") {
+                        "rate_limit_exceeded" => FailureCause::RateLimited,
+                        "server_error" | "internal_error" => FailureCause::ProviderUnavailable,
+                        _ => FailureCause::Rejected,
+                    };
+                    return Err(ProviderError::frame(message, cause));
                 }
                 _ => {}
             }
         }
     }
-    Err((
-        "stream ended unexpectedly".into(),
-        crate::core::provider::ErrorKind::Delivered,
-    ))
+    Err(ProviderError::stalled("stream ended unexpectedly"))
 }
