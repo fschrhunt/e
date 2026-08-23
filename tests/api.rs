@@ -465,6 +465,7 @@ rl.on("line", (line) => {
 /// An extension whose process dies before answering initialize must fail
 /// fast — its death is detected on stdout EOF and reported, never left to
 /// hold the launch for the full 5 s timeout (the startup-stall bug).
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn dead_extension_fails_fast_instead_of_stalling() {
     // A valid script with no stdin reader: node drains its event loop and
