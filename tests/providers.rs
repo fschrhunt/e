@@ -50,7 +50,6 @@ enum History {
 }
 
 enum ToolExpect {
-    None,
     Exact {
         id: &'static str,
         args: &'static str,
@@ -301,7 +300,6 @@ fn history_messages(kind: &History) -> Vec<ChatMessage> {
 
 fn assert_tool(name: &str, calls: &[ToolCall], expect: &ToolExpect) {
     match expect {
-        ToolExpect::None => assert!(calls.is_empty(), "{name}"),
         ToolExpect::Exact { id, args } => {
             assert_eq!(calls.len(), 1, "{name}");
             assert_eq!(calls[0].id, *id, "{name}");
