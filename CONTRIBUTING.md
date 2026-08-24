@@ -54,13 +54,6 @@ cargo clippy --all-targets -- -D warnings
 ./scripts/guard.sh                           # the security-surface audit
 ```
 
-Live Vercel AI Gateway tests are ignored — they spend tokens, so they are
-not part of CI. When you want a live check, with `AI_GATEWAY_API_KEY` set:
-
-```sh
-cargo test --test gateway -- --ignored --nocapture
-```
-
 The guard pins e's trust boundary: which hosts the binary may talk to, that
 e reads only `~/.e/`, that credential writes go through the merge-write
 store, where `unsafe` lives, and that CI actions stay SHA-pinned. If your

@@ -41,9 +41,9 @@ built-in's provider and id replaces it — the file wins, like themes.
 credential falls back to its conventional environment variable —
 `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`, `OPENCODE_API_KEY`,
 `OPENCODE_GO_API_KEY`, `AI_GATEWAY_API_KEY` — which is what CI and scripts
-want. `auth.json` wins when both exist. Vercel AI Gateway is API-key only
-(`/login vercel`); its model ids are `provider/model` (e.g.
-`openai/gpt-4.1-nano`) and the live catalog fills in the rest.
+want. `auth.json` wins when both exist. Vercel AI Gateway (`/login vercel`)
+is API-key only; model ids are `provider/model` (e.g. `anthropic/claude-sonnet-5`)
+and the live catalog fills in the rest.
 
 ## The catalog is live
 
