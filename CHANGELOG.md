@@ -8,6 +8,10 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- Provider tests share one harness in `tests/providers.rs`: the three
+  wire dialects, the catalog, and the registry are cases on the same
+  mock server and `E_HOME` lock, instead of a file per provider.
+
 - Audit fixes: session directories now use collision-resistant workspace keys
   while safely discovering legacy logs; provider SSE parsing preserves UTF-8
   across arbitrary byte chunks; live-discovered models inherit their
