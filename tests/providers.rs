@@ -8,8 +8,8 @@ mod common;
 
 use common::{clear_env_keys, env_lock, read_tool, request_json, serve_sse, test_model, Home};
 
-use e::core::provider::catalog::{self, Api, Model, Thinking};
-use e::core::provider::{self, ChatMessage, Event, Request, SseSplitter, ToolCall};
+use e::core::providers::catalog::{self, Api, Model, Thinking};
+use e::core::providers::{self, ChatMessage, Event, FinishReason, Request, SseSplitter, ToolCall};
 
 // ---------------------------------------------------------------------------
 // Shared framing
@@ -41,6 +41,29 @@ fn sse_splitter_preserves_utf8_across_byte_chunks() {
 // Dialects — one table, one pin per wire contract
 // ---------------------------------------------------------------------------
 
+enum History {
+    UserOnly,
+    /// Anthropic reshapes tool results on the way out.
+    AnthropicToolLoop,
+    /// Gemini replays thought signatures on the prior function call.
+    GoogleToolLoop,
+}
+
+enum ToolExpect {
+    None,
+    Exact {
+        id: &'static str,
+        args: &'static str,
+    },
+    /// Gemini synthesizes ids (`read-N`) and attaches thought signatures.
+    Synthesized {
+        name: &'static str,
+        id_prefix: &'static str,
+        args_json: &'static str,
+        signature: Option<&'static str>,
+    },
+}
+
 struct DialectCase {
     name: &'static str,
     provider: &'static str,
@@ -48,14 +71,13 @@ struct DialectCase {
     api: Api,
     thinking: Thinking,
     effort: Option<&'static str>,
-    /// Anthropic is the only dialect that reshapes tool results on the way
-    /// out; the others still get a user turn so the request isn't empty.
-    history: bool,
+    history: History,
     sse: &'static str,
     text: &'static str,
     reasoning: &'static str,
     usage: Option<(u64, u64, u64)>,
-    tool: Option<(&'static str, &'static str)>,
+    tool: ToolExpect,
+    finish: Option<FinishReason>,
 }
 
 fn dialects() -> Vec<DialectCase> {
@@ -67,7 +89,7 @@ fn dialects() -> Vec<DialectCase> {
             api: Api::Completions,
             thinking: Thinking::Manual,
             effort: None,
-            history: false,
+            history: History::UserOnly,
             sse: concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
@@ -81,7 +103,11 @@ fn dialects() -> Vec<DialectCase> {
             text: "Hello",
             reasoning: "hmm",
             usage: Some((12, 3, 4)),
-            tool: Some(("c1", "{\"path\":\"a.txt\"}")),
+            tool: ToolExpect::Exact {
+                id: "c1",
+                args: "{\"path\":\"a.txt\"}",
+            },
+            finish: None,
         },
         DialectCase {
             name: "anthropic",
@@ -90,7 +116,7 @@ fn dialects() -> Vec<DialectCase> {
             api: Api::Anthropic,
             thinking: Thinking::Manual,
             effort: Some("high"),
-            history: true,
+            history: History::AnthropicToolLoop,
             sse: concat!(
                 "event: message_start\n",
                 "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":40}}}\n\n",
@@ -110,8 +136,14 @@ fn dialects() -> Vec<DialectCase> {
             ),
             text: "hello world",
             reasoning: "hmm",
-            usage: Some((100, 25, 40)),
-            tool: Some(("tu_1", "{\"path\":\"a.txt\"}")),
+            // Anthropic's prompt fields are disjoint: input is the inclusive
+            // total (100 uncached + 40 cache-read), cache_read the subset.
+            usage: Some((140, 25, 40)),
+            tool: ToolExpect::Exact {
+                id: "tu_1",
+                args: "{\"path\":\"a.txt\"}",
+            },
+            finish: None,
         },
         DialectCase {
             name: "responses",
@@ -120,7 +152,7 @@ fn dialects() -> Vec<DialectCase> {
             api: Api::Responses,
             thinking: Thinking::Manual,
             effort: Some("medium"),
-            history: false,
+            history: History::UserOnly,
             sse: concat!(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
                 "data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"hmm\"}\n\n",
@@ -130,7 +162,36 @@ fn dialects() -> Vec<DialectCase> {
             text: "hi",
             reasoning: "hmm",
             usage: Some((10, 2, 0)),
-            tool: Some(("c1", "{\"path\":\"a.txt\"}")),
+            tool: ToolExpect::Exact {
+                id: "c1",
+                args: "{\"path\":\"a.txt\"}",
+            },
+            finish: None,
+        },
+        DialectCase {
+            name: "google",
+            provider: "google",
+            auth: r#"{"google":{"key":"g-test"}}"#,
+            api: Api::Google,
+            thinking: Thinking::Manual,
+            effort: Some("high"),
+            history: History::GoogleToolLoop,
+            sse: concat!(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"planning\",\"thought\":true}]}}]}\n\n",
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n",
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"},{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"a.txt\"}},\"thoughtSignature\":\"sig-1\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":90,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":5,\"cachedContentTokenCount\":30}}\n\n",
+            ),
+            text: "hello world",
+            reasoning: "planning",
+            // Thought tokens count as output.
+            usage: Some((90, 25, 30)),
+            tool: ToolExpect::Synthesized {
+                name: "read",
+                id_prefix: "read-",
+                args_json: r#"{"path":"a.txt"}"#,
+                signature: Some("sig-1"),
+            },
+            finish: Some(FinishReason::Normal),
         },
     ]
 }
@@ -184,18 +245,104 @@ fn assert_wire(name: &str, sent: &str) {
                     || sent.contains("Authorization: Bearer sk-test")
             );
         }
+        "google" => {
+            assert!(sent.contains("POST /models/test:streamGenerateContent?alt=sse"));
+            assert!(sent.contains("x-goog-api-key: g-test"));
+            assert_eq!(body["systemInstruction"]["parts"][0]["text"], "sys");
+            assert_eq!(
+                body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+                "high"
+            );
+            assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read");
+            let contents = body["contents"].as_array().unwrap();
+            assert_eq!(contents[1]["role"], "model");
+            assert_eq!(contents[1]["parts"][0]["functionCall"]["name"], "read");
+            assert_eq!(contents[1]["parts"][0]["thoughtSignature"], "sig-0");
+            assert_eq!(contents[2]["parts"][0]["functionResponse"]["name"], "read");
+        }
         other => panic!("unknown dialect {other}"),
+    }
+}
+
+fn history_messages(kind: &History) -> Vec<ChatMessage> {
+    match kind {
+        History::UserOnly => vec![ChatMessage::user("hello")],
+        History::AnthropicToolLoop => vec![
+            ChatMessage::user("read a.txt"),
+            ChatMessage::assistant(
+                "",
+                vec![ToolCall {
+                    id: "tu_0".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"old.txt\"}".into(),
+                    signature: None,
+                }],
+            ),
+            ChatMessage::tool_result("tu_0", "old contents"),
+        ],
+        History::GoogleToolLoop => vec![
+            ChatMessage::user("read a.txt"),
+            // A foreign-dialect id (an OpenAI-style call id from a
+            // mid-session model switch): the functionResponse name must
+            // come from the call it refers to, never from the id's spelling.
+            ChatMessage::assistant(
+                "",
+                vec![ToolCall {
+                    id: "call_abc123".into(),
+                    name: "read".into(),
+                    arguments: "{\"path\":\"old.txt\"}".into(),
+                    signature: Some("sig-0".into()),
+                }],
+            ),
+            ChatMessage::tool_result("call_abc123", "old contents"),
+        ],
+    }
+}
+
+fn assert_tool(name: &str, calls: &[ToolCall], expect: &ToolExpect) {
+    match expect {
+        ToolExpect::None => assert!(calls.is_empty(), "{name}"),
+        ToolExpect::Exact { id, args } => {
+            assert_eq!(calls.len(), 1, "{name}");
+            assert_eq!(calls[0].id, *id, "{name}");
+            assert_eq!(calls[0].arguments, *args, "{name}");
+        }
+        ToolExpect::Synthesized {
+            name: tool_name,
+            id_prefix,
+            args_json,
+            signature,
+        } => {
+            assert_eq!(calls.len(), 1, "{name}");
+            assert_eq!(calls[0].name, *tool_name, "{name}");
+            assert!(
+                calls[0].id.starts_with(id_prefix),
+                "{name}: id {}",
+                calls[0].id
+            );
+            let got: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+            let want: serde_json::Value = serde_json::from_str(args_json).unwrap();
+            assert_eq!(got, want, "{name}");
+            assert_eq!(calls[0].signature.as_deref(), *signature, "{name}");
+        }
     }
 }
 
 async fn collect_stream(
     request: Request,
-) -> (String, String, Vec<ToolCall>, Option<(u64, u64, u64)>) {
-    let (mut rx, _handle) = provider::stream(request);
+) -> (
+    String,
+    String,
+    Vec<ToolCall>,
+    Option<(u64, u64, u64)>,
+    Option<FinishReason>,
+) {
+    let (mut rx, _handle) = providers::stream(request);
     let mut text = String::new();
     let mut reasoning = String::new();
     let mut calls = Vec::new();
     let mut usage = None;
+    let mut finish = None;
     while let Some(event) = rx.recv().await {
         match event {
             Event::TextDelta(d) => text.push_str(&d),
@@ -207,11 +354,14 @@ async fn collect_stream(
                 cache_read,
             } => usage = Some((input, output, cache_read)),
             Event::Error(err) => panic!("stream errored: {}", err.message),
-            Event::Done => break,
+            Event::Done(end) => {
+                finish = Some(end.finish);
+                break;
+            }
             Event::ReasoningItem(_) => {}
         }
     }
-    (text, reasoning, calls, usage)
+    (text, reasoning, calls, usage, finish)
 }
 
 // The env lock is held across awaits: E_HOME must stay ours and each
@@ -227,42 +377,22 @@ async fn each_dialect_streams_text_tools_and_usage() {
 
         let mut model = test_model(case.provider, port, case.api);
         model.thinking = case.thinking;
-        let messages = if case.history {
-            vec![
-                ChatMessage::user("read a.txt"),
-                ChatMessage::assistant(
-                    "",
-                    vec![ToolCall {
-                        id: "tu_0".into(),
-                        name: "read".into(),
-                        arguments: "{\"path\":\"old.txt\"}".into(),
-                    }],
-                ),
-                ChatMessage::tool_result("tu_0", "old contents"),
-            ]
-        } else {
-            vec![ChatMessage::user("hello")]
-        };
         let request = Request {
             model,
             system: "sys".into(),
-            messages,
+            messages: history_messages(&case.history),
             effort: case.effort.map(str::to_string),
             tools: vec![read_tool()],
         };
 
-        let (text, reasoning, calls, usage) = collect_stream(request).await;
+        let (text, reasoning, calls, usage, finish) = collect_stream(request).await;
         assert_eq!(text, case.text, "{}", case.name);
         assert_eq!(reasoning, case.reasoning, "{}", case.name);
-        match case.tool {
-            Some((id, args)) => {
-                assert_eq!(calls.len(), 1, "{}", case.name);
-                assert_eq!(calls[0].id, id, "{}", case.name);
-                assert_eq!(calls[0].arguments, args, "{}", case.name);
-            }
-            None => assert!(calls.is_empty(), "{}", case.name),
-        }
+        assert_tool(case.name, &calls, &case.tool);
         assert_eq!(usage, case.usage, "{}", case.name);
+        if let Some(want) = case.finish {
+            assert_eq!(finish, Some(want), "{}", case.name);
+        }
 
         let sent = server.join().unwrap();
         assert_eq!(sent.len(), 1, "{}", case.name);
@@ -293,7 +423,7 @@ async fn adaptive_models_take_effort_through_output_config() {
         effort: Some("high".into()),
         tools: Vec::new(),
     };
-    let (_text, _reasoning, _calls, _usage) = collect_stream(request).await;
+    let (_text, _reasoning, _calls, _usage, _finish) = collect_stream(request).await;
 
     let sent = server.join().unwrap().remove(0);
     assert!(
@@ -308,6 +438,98 @@ async fn adaptive_models_take_effort_through_output_config() {
         !sent.contains("budget_tokens"),
         "legacy budget_tokens must not reach an adaptive model"
     );
+}
+
+/// Signed thinking blocks round-trip a tool loop: the stream's thinking +
+/// signature becomes a replayable reasoning item, and the follow-up request
+/// carries it verbatim at the head of the assistant turn, before tool_use.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_thinking_blocks_are_captured_and_replayed() {
+    let _lock = env_lock();
+    let first = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me look\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig-abc\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"read\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let second = concat!(
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (port, server) = serve_sse(&[first, second]);
+    let home = Home::new("signed-think");
+    home.auth(r#"{"anthropic":{"key":"sk-ant-test"}}"#);
+
+    let mut model = test_model("anthropic", port, Api::Anthropic);
+    model.thinking = Thinking::Adaptive;
+
+    let request = Request {
+        model: model.clone(),
+        system: "sys".into(),
+        messages: vec![ChatMessage::user("read a.txt")],
+        effort: Some("high".into()),
+        tools: Vec::new(),
+    };
+    let (mut rx, _handle) = providers::stream(request);
+    let mut items = Vec::new();
+    let mut calls = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::ReasoningItem(item) => items.push(item),
+            Event::ToolCall(c) => calls.push(c),
+            Event::Error(err) => panic!("stream errored: {}", err.message),
+            Event::Done(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(items.len(), 1, "one signed thinking block captured");
+    let block: serde_json::Value = serde_json::from_str(&items[0]).unwrap();
+    assert_eq!(block["type"], "thinking");
+    assert_eq!(block["thinking"], "let me look");
+    assert_eq!(block["signature"], "sig-abc");
+    assert_eq!(calls.len(), 1);
+
+    let request = Request {
+        model,
+        system: "sys".into(),
+        messages: vec![
+            ChatMessage::user("read a.txt"),
+            ChatMessage {
+                role: "reasoning".into(),
+                content: items.remove(0),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_meta: None,
+            },
+            ChatMessage::assistant("", calls.clone()),
+            ChatMessage::tool_result("tu_1", "contents"),
+        ],
+        effort: Some("high".into()),
+        tools: Vec::new(),
+    };
+    let (_text, _reasoning, _calls, _usage, _finish) = collect_stream(request).await;
+
+    let sent = server.join().unwrap();
+    assert_eq!(sent.len(), 2);
+    let value = request_json(&sent[1]);
+    let assistant = &value["messages"][1];
+    assert_eq!(assistant["role"], "assistant");
+    let content = assistant["content"].as_array().unwrap();
+    assert_eq!(
+        content[0]["type"], "thinking",
+        "thinking must lead the assistant turn"
+    );
+    assert_eq!(content[0]["signature"], "sig-abc");
+    assert_eq!(content[0]["thinking"], "let me look");
+    assert_eq!(content[1]["type"], "tool_use");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -365,6 +587,31 @@ async fn responses_replays_reasoning_items_ahead_of_their_calls() {
     assert_eq!(item["id"], "rs_1");
 }
 
+/// MAX_TOKENS from Gemini is a truncated reply delivered as HTTP success;
+/// the dialect must name it instead of finishing normally.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn google_max_tokens_maps_to_length() {
+    let _lock = env_lock();
+    let body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"cut\"}]}}]}\n\n",
+        "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n",
+    );
+    let (port, _server) = serve_sse(&[body]);
+    let home = Home::new("google-len");
+    home.auth(r#"{"google":{"key":"g-test"}}"#);
+
+    let request = Request {
+        model: test_model("google", port, Api::Google),
+        system: "sys".into(),
+        messages: vec![ChatMessage::user("hi")],
+        effort: None,
+        tools: Vec::new(),
+    };
+    let (_text, _reasoning, _calls, _usage, finish) = collect_stream(request).await;
+    assert_eq!(finish, Some(FinishReason::Length));
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn unexpected_eof_is_an_error_not_a_silent_done() {
@@ -382,7 +629,7 @@ async fn unexpected_eof_is_an_error_not_a_silent_done() {
         effort: None,
         tools: Vec::new(),
     };
-    let (mut rx, _handle) = provider::stream(request);
+    let (mut rx, _handle) = providers::stream(request);
     let mut saw_text = false;
     let mut terminal = None;
     while let Some(event) = rx.recv().await {
@@ -392,7 +639,7 @@ async fn unexpected_eof_is_an_error_not_a_silent_done() {
                 terminal = Some(err.message);
                 break;
             }
-            Event::Done => panic!("unexpected EOF must not finish as Done"),
+            Event::Done(_) => panic!("unexpected EOF must not finish as Done"),
             _ => {}
         }
     }
@@ -406,7 +653,7 @@ async fn unexpected_eof_is_an_error_not_a_silent_done() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unanswered_request_fails_instead_of_hanging() {
-    use e::core::provider::{http, send_request_within, FailureCause};
+    use e::core::providers::{http, send_request_within, FailureCause};
     use std::time::Duration;
 
     // The gap between connect (client-bounded) and body reads (chunk-bounded):
@@ -452,8 +699,8 @@ fn registry_and_catalog_match_the_embedded_data() {
     clear_env_keys();
     let _home = Home::new("registry");
 
-    let all = e::core::provider::registry::all();
-    assert!(all.len() >= 6);
+    let all = e::core::providers::registry::all();
+    assert!(all.len() >= 17);
     let catalog = catalog::catalog();
 
     for provider in all {
@@ -462,9 +709,16 @@ fn registry_and_catalog_match_the_embedded_data() {
             "{} has no display name",
             provider.name
         );
-        assert!(provider.base_url.starts_with("https://"));
+        // Remote backends speak TLS; only keyless local backends may not.
         assert!(
-            provider.auth.oauth.is_some() || provider.auth.key,
+            provider.base_url.starts_with("https://")
+                || (provider.auth.none && provider.base_url.starts_with("http://localhost")),
+            "{}: suspicious base_url {}",
+            provider.name,
+            provider.base_url
+        );
+        assert!(
+            provider.auth.oauth.is_some() || provider.auth.key || provider.auth.none,
             "{} has no way to sign in",
             provider.name
         );
@@ -475,6 +729,12 @@ fn registry_and_catalog_match_the_embedded_data() {
                 provider.name
             );
         }
+        // Local backends discover their models live; everyone else ships seeds.
+        assert!(
+            provider.auth.none || !provider.models.is_empty(),
+            "{} has no seed models",
+            provider.name
+        );
         assert_eq!(catalog::display_name(&provider.name), provider.display);
 
         for decl in &provider.models {
@@ -496,13 +756,21 @@ fn registry_and_catalog_match_the_embedded_data() {
         }
     }
 
-    // Panel contents, from data: two account flows, six key providers.
-    assert_eq!(e::core::provider::registry::oauth_providers().len(), 2);
-    assert_eq!(e::core::provider::registry::key_providers().len(), 6);
+    // Panel contents, from data: two account flows, fourteen key providers
+    // (the keyless locals appear in neither panel).
+    assert_eq!(e::core::providers::registry::oauth_providers().len(), 2);
+    assert_eq!(e::core::providers::registry::key_providers().len(), 14);
 
-    let vercel = e::core::provider::registry::find("vercel").expect("vercel is a built-in");
+    let vercel = e::core::providers::registry::find("vercel").expect("vercel is a built-in");
     assert_eq!(vercel.auth.key_env.as_deref(), Some("AI_GATEWAY_API_KEY"));
     assert!(vercel.auth.oauth.is_none(), "gateway is API-key only");
+
+    let google = e::core::providers::registry::find("google").expect("google is a built-in");
+    assert_eq!(google.api(), Api::Google);
+    assert_eq!(google.auth.key_env.as_deref(), Some("GEMINI_API_KEY"));
+
+    let ollama = e::core::providers::registry::find("ollama").expect("ollama is a built-in");
+    assert!(ollama.auth.none && !ollama.auth.key);
 
     assert!(
         !catalog.iter().any(|m| m.id == "grok-build-0.1"),
@@ -523,6 +791,34 @@ fn registry_and_catalog_match_the_embedded_data() {
         .find(|m| m.provider == "opencode-zen")
         .unwrap();
     assert_ne!(go.base_url, zen.base_url, "Go and Zen must stay distinct");
+
+    let grok43 = catalog
+        .iter()
+        .find(|m| m.provider == "xai" && m.id == "grok-4.3")
+        .unwrap();
+    assert_eq!(grok43.context_window, 1_000_000);
+    let grok46 = catalog
+        .iter()
+        .find(|m| m.provider == "xai" && m.id == "grok-4.6")
+        .unwrap();
+    assert_eq!(grok46.context_window, 500_000);
+
+    let thinking = |id: &str| {
+        catalog
+            .iter()
+            .find(|m| m.provider == "anthropic" && m.id == id)
+            .unwrap_or_else(|| panic!("{id} missing from the built-in catalog"))
+            .thinking
+    };
+    for id in [
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+    ] {
+        assert_eq!(thinking(id), Thinking::Adaptive, "{id} must be adaptive");
+    }
+    assert_eq!(thinking("claude-haiku-4-5"), Thinking::Manual);
 }
 
 #[test]
@@ -668,7 +964,7 @@ fn env_keys_sign_providers_in() {
 
     // Every key_env the registry declares is a real sign-in, not just
     // Anthropic's. Walk them so a new provider is covered by this test.
-    for provider in e::core::provider::registry::all() {
+    for provider in e::core::providers::registry::all() {
         let Some(env) = &provider.auth.key_env else {
             continue;
         };
@@ -695,6 +991,25 @@ fn env_keys_sign_providers_in() {
         _ => panic!("wrong credential kind"),
     }
     std::env::remove_var("ANTHROPIC_API_KEY");
+}
+
+/// Keyless local backends (Ollama, LM Studio) count as signed in with no
+/// stored credential and no env var — but never as phantom `auth::load()`
+/// entries, so first-run onboarding still sees an empty credential file.
+/// Their models come solely from the live /models refresh, so with no
+/// server running they contribute nothing to the catalog.
+#[test]
+fn keyless_local_providers_are_signed_in_without_credentials() {
+    let _lock = env_lock();
+    let _home = Home::new("keyless");
+    clear_env_keys();
+
+    let auth = e::core::auth::load();
+    assert!(auth.is_empty(), "no phantom credentials for keyless locals");
+    assert!(e::core::auth::signed_in(&auth, "ollama"));
+    assert!(e::core::auth::signed_in(&auth, "lmstudio"));
+    assert!(!e::core::auth::signed_in(&auth, "anthropic"));
+    assert!(catalog::available().is_empty());
 }
 
 #[test]
@@ -788,4 +1103,68 @@ async fn provider_reported_models_appear_without_a_release() {
         .any(|m| m.id == "brand-new-model"));
 
     catalog::refresh_remote().await;
+}
+
+// Google's live list is its own dialect: same `/models` path, but
+// `x-goog-api-key` auth and a `models[].name` payload. The overlay must speak
+// it — otherwise signed-in Google users only ever see the seed ids.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn google_model_refresh_speaks_the_gemini_dialect() {
+    use std::io::{Read, Write};
+    let _lock = env_lock();
+    clear_env_keys();
+    let home = Home::new("google-live");
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut a, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = a.read(&mut buf).unwrap();
+        let sent = String::from_utf8_lossy(&buf[..n]).to_string();
+        let body = r#"{"models":[
+            {"name":"models/gemini-fresh-pro","supportedGenerationMethods":["generateContent"],"inputTokenLimit":1048576},
+            {"name":"models/gemini-text-embedding","supportedGenerationMethods":["embedContent"]},
+            {"name":"models/veo-video","supportedGenerationMethods":["predictLongRunning"]}
+        ]}"#;
+        let _ = a.write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        sent
+    });
+
+    home.auth(r#"{"google":{"key":"AIza-test"}}"#);
+    // Every google id rides the mock: refresh_remote dedupes to one base_url
+    // per provider — the first catalog entry's — so leaving any builtin on
+    // the real endpoint would send the probe there instead of here.
+    home.write(
+        "models.json",
+        format!(
+            r#"{{"providers":{{"google":{{"base_url":"http://127.0.0.1:{port}","api":"google-generative-ai","models":["gemini-3-pro","gemini-3-flash","gemini-fresh-pro"]}}}}}}"#
+        ),
+    );
+
+    catalog::refresh_remote().await;
+    let sent = server.join().unwrap();
+    assert!(sent.contains("GET /models"));
+    assert!(
+        sent.contains("x-goog-api-key: AIza-test"),
+        "Google's list endpoint takes the key header, not a bearer token"
+    );
+
+    let catalog = catalog::catalog();
+    let fresh = catalog
+        .iter()
+        .find(|m| m.provider == "google" && m.id == "gemini-fresh-pro")
+        .expect("the `models[].name` payload applies to the catalog");
+    assert_eq!(fresh.context_window, 1_048_576);
+    assert_eq!(fresh.api, Api::Google);
+    assert!(!catalog
+        .iter()
+        .any(|m| m.provider == "google" && (m.id.contains("embedding") || m.id.contains("veo"))));
 }

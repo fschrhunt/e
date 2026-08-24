@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
-use e::core::provider::catalog::{Api, Model, Thinking};
+use e::core::providers::catalog::{Api, Model, Thinking};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -24,7 +24,7 @@ pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Registry env keys leak a developer's real sign-in into signed-out
 /// assertions. Clear every declared `key_env` for this process.
 pub fn clear_env_keys() {
-    for provider in e::core::provider::registry::all() {
+    for provider in e::core::providers::registry::all() {
         if let Some(env) = &provider.auth.key_env {
             std::env::remove_var(env);
         }

@@ -11,7 +11,8 @@ use std::time::Duration;
 use common::{env_lock, serve_raw, serve_sse, sse_response, test_model, Home};
 
 use e::core::agent::{Agent, SessionEvent};
-use e::core::provider::catalog::Api;
+use e::core::providers::catalog::Api;
+use e::core::providers::FailureCause;
 
 fn mock_home() -> Home {
     let home = Home::new("stream");
@@ -62,8 +63,6 @@ async fn agent_folds_provider_events_into_one_session_stream() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_reports_errors_and_still_ends_the_turn_exactly_once() {
     let _lock = env_lock();
-    // A 401 is an auth-class failure: never retried, so one request, one
-    // deterministic ending.
     let (port, _server) = serve_raw(vec![
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into(),
     ]);
@@ -92,8 +91,6 @@ async fn agent_reports_errors_and_still_ends_the_turn_exactly_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_interrupt_ends_a_stalled_stream() {
     let _lock = env_lock();
-    // Headers arrive, then the body never does — the pre-fix hang: Esc set
-    // the cancel flag but the turn only checked it after the next SSE event.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let _home = mock_home();
@@ -174,8 +171,6 @@ async fn agent_interrupt_ends_a_turn_stuck_before_headers() {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_recovers_after_a_transient_failure() {
-    use e::core::provider::FailureCause;
-
     let _lock = env_lock();
     let ok = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
@@ -298,4 +293,117 @@ async fn a_blank_successful_stream_surfaces_an_error_not_silence() {
         }
     }
     assert!(saw_error, "a blank success must surface an error");
+}
+
+/// A 200 stream the provider cut at its output limit must not read as a
+/// finished turn: the finish reason is mapped, and skipped malformed
+/// payloads are counted instead of vanishing.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn truncation_and_malformed_payloads_surface_in_stream_end() {
+    use e::core::providers::{stream, ChatMessage, Event, FinishReason, Request};
+
+    let _lock = env_lock();
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {not json at all}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (port, _server) = serve_sse(&[body]);
+    let _home = mock_home();
+
+    let request = Request {
+        model: test_model("mock", port, Api::Completions),
+        system: "sys".into(),
+        messages: vec![ChatMessage::user("hi")],
+        effort: None,
+        tools: Vec::new(),
+    };
+    let (mut rx, _handle) = stream(request);
+
+    let mut end = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::Done(e) => {
+                end = Some(e);
+                break;
+            }
+            Event::Error(err) => panic!("stream error: {}", err.message),
+            _ => {}
+        }
+    }
+    let end = end.unwrap();
+    assert_eq!(end.finish, FinishReason::Length);
+    assert_eq!(end.malformed, 1);
+}
+
+/// End to end: an abnormal finish becomes a visible turn warning, not a
+/// silently accepted truncation.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_warns_on_truncated_turn() {
+    let _lock = env_lock();
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"cut off mid\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (port, _server) = serve_sse(&[body]);
+    let _home = mock_home();
+
+    let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
+    agent.submit("hi".into(), "sys".into());
+
+    let mut warning = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            SessionEvent::Warning(message) => warning = Some(message),
+            SessionEvent::TurnEnd { .. } => break,
+            _ => {}
+        }
+    }
+    let warning = warning.expect("a truncated turn must warn");
+    assert!(
+        warning.contains("truncated"),
+        "unexpected warning: {warning}"
+    );
+}
+
+/// A body transport failure after successful headers but before any output
+/// is retryable — a 503 and an idle timeout already were, and this was the
+/// inconsistent gap. The agent's nothing-produced guard still blocks replays
+/// once content has streamed.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn body_transport_error_before_output_retries() {
+    let _lock = env_lock();
+    let ok = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (port, _server) = serve_raw(vec![
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 500\r\nconnection: close\r\n\r\ndata: {\"cho".into(),
+        sse_response(ok),
+    ]);
+    let _home = mock_home();
+
+    let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
+    agent.submit("hi".into(), "sys".into());
+
+    let mut saw_retry = false;
+    let mut saw_error = false;
+    let mut text = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            SessionEvent::Retry { .. } => saw_retry = true,
+            SessionEvent::Error(_) => saw_error = true,
+            SessionEvent::TextDelta(d) => text.push_str(&d),
+            SessionEvent::TurnEnd { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(saw_retry, "a pre-output body failure must retry");
+    assert!(!saw_error, "the retry should recover the turn");
+    assert_eq!(text, "ok");
 }
