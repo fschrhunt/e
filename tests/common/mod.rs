@@ -1,4 +1,5 @@
 //! Shared fixtures for the integration tests.
+#![allow(dead_code)] // each test crate takes a subset of the helpers
 //!
 //! Each `tests/*.rs` crate `mod common;`s this directory. `E_HOME` is
 //! process-global, so anything that writes it takes `env_lock()` first —

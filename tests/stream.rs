@@ -237,7 +237,7 @@ async fn retry_campaign_gives_up_after_max_attempts() {
     let _lock = env_lock();
     let fail =
         "HTTP/1.1 503 Service Unavailable\r\nretry-after: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-    let (port, _server) = serve_raw(vec![fail.to_string(); MAX_ATTEMPTS]);
+    let (port, _server) = serve_raw(vec![fail.to_string(); MAX_ATTEMPTS as usize]);
     let _home = mock_home();
 
     let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
