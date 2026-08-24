@@ -12,6 +12,13 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings
 ./scripts/guard.sh   # the security-surface audit — CI runs all of these
 ```
 
+Live Vercel AI Gateway tests are ignored so CI never spends tokens. Run them
+only when asked, with `AI_GATEWAY_API_KEY` (or `AI_GATEWAY`) set:
+
+```sh
+cargo test --test gateway -- --ignored --nocapture
+```
+
 `cargo test` is not optional. The visual design is pinned byte-for-byte in
 `tests/` against the reference design's own literals. If a rendering change
 makes the tests fail, you drifted the look — fix the code, don't loosen the
