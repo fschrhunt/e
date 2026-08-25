@@ -10,8 +10,8 @@ One small, fast binary — extend it with your own tools, commands, themes, and 
 cargo install --git https://github.com/fschrhunt/e
 ```
 
-Until the first release there is nothing to download — install.sh and the
-Homebrew tap light up with it.
+> [!NOTE]
+> 𝑒 is under active development — expect breaking changes and rough edges.
 
 · · ·
 
