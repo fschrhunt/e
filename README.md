@@ -7,7 +7,7 @@
 One small, fast binary — extend it with your own tools, commands, themes, and skills.
 
 ```sh
-cargo install --git https://github.com/fschrhunt/e
+cargo install --git https://github.com/intuitumxyz/e
 ```
 
 > [!NOTE]
