@@ -520,7 +520,9 @@ impl App {
     }
 
     fn open_resume_menu(&mut self) {
-        if self.active.is_some() {
+        // Both checks: `active` covers a turn whose TurnStart has been seen,
+        // `is_streaming` covers the gap between submit and that event.
+        if self.active.is_some() || self.agent.is_streaming() {
             self.notice("a turn is running — press Esc to stop it, then /resume".into());
             return;
         }
@@ -559,8 +561,9 @@ impl App {
     fn resume_path(&mut self, path: std::path::PathBuf) {
         // The picker can already be open when a turn starts (queued prompt);
         // re-check here so a selection can never splice a running turn's
-        // output into the resumed session.
-        if self.active.is_some() {
+        // output into the resumed session. `is_streaming` also covers the
+        // gap between a submit and its TurnStart event.
+        if self.active.is_some() || self.agent.is_streaming() {
             self.notice("a turn is running — press Esc to stop it, then resume".into());
             return;
         }
@@ -649,6 +652,11 @@ impl App {
                 _ => {}
             }
         }
+        // Seed the context gauge from the restored history so the statusline
+        // and the auto-compact check don't see an empty context until the
+        // first real usage report lands.
+        let seeded: usize = messages.iter().map(|m| m.content.len()).sum();
+        self.context_tokens = (seeded / 4) as u64;
         self.agent.load_history(messages);
         self.agent.set_session(Some(session));
         // Identity travels together: the resumed log's persisted name
@@ -1112,8 +1120,10 @@ impl App {
             }
             "/new" | "/clear" => {
                 // A running turn owns the history and session log; replacing
-                // them mid-turn would commit its reply into the wrong session.
-                if self.active.is_some() {
+                // them mid-turn would commit its reply into the wrong
+                // session. `is_streaming` also covers the gap between a
+                // submit and its TurnStart event.
+                if self.active.is_some() || self.agent.is_streaming() {
                     self.notice("a turn is running — press Esc to stop it, then /new".into());
                     return;
                 }
@@ -1333,6 +1343,15 @@ impl App {
                     }
                 }
             }
+            SessionEvent::ToolCallAssembly { bytes } => {
+                // The model is streaming tool-call arguments — no text to
+                // show yet, but the row must move: phase plus a ticking
+                // estimate, so a long write call never looks like a stall.
+                if let Some(s) = &mut self.active {
+                    s.turn.phase = TurnPhase::ToolAssembly;
+                    s.turn.note_assembly(bytes);
+                }
+            }
             SessionEvent::ToolBatchStart { calls } => {
                 if let Some(s) = &mut self.active {
                     s.block = None;
@@ -1438,9 +1457,10 @@ impl App {
                     // steps re-counted the same tokens once per step and
                     // showed absurd totals for long tool loops. Latest wins
                     // (displacing the seed estimate); only `output` — the
-                    // tokens each step actually generated — accumulates.
-                    s.turn.input = input;
-                    s.turn.output += output;
+                    // tokens each step actually generated — accumulates, and
+                    // the live chars/4 estimate resets to cover only what the
+                    // next step streams.
+                    s.turn.note_usage(input, output);
                 }
             }
             SessionEvent::Retry {
@@ -1463,6 +1483,9 @@ impl App {
                         reason,
                     });
                     s.turn.recovered = None;
+                    // The abandoned attempt's argument bytes die with it —
+                    // the fresh attempt streams from scratch.
+                    s.turn.note_assembly(0);
                     // A retry replays its thinking fresh; the abandoned
                     // attempt's block stays behind as history and stays
                     // live until TurnEnd dims the whole turn.

@@ -8,6 +8,21 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- Tool-call assembly is visible while it streams: the one long stream phase
+  with no text — a model writing a large `write` call generates argument
+  JSON for tens of seconds — used to freeze the transcript and the token
+  counter while the turn was alive. Dialects now emit argument-delta
+  progress, the activity row gets its own "Writing tool call (Ns) (↑ ↓)"
+  phase, and the argument bytes tick the live output estimate.
+- The live token estimate resets at every real usage report, so the
+  in-flight display is real counted tokens plus only the current step's
+  chars/4 delta — never an estimate stacked on tokens already counted.
+- A resumed session seeds the context gauge from its restored history
+  instead of showing an empty context until the first usage report.
+- `/new` and `/resume` also refuse during the brief gap between a submit
+  and its TurnStart event, closing a race that could swap session state
+  under a just-started turn.
+
 - Turn token accounting is honest: the trailer's ↑ used to sum every step's
   full context (a 20-step turn over a 100k context showed ↑2000k); it now
   shows the request size (latest wins) while ↓ keeps accumulating what each

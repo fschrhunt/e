@@ -238,8 +238,15 @@ pub async fn run(request: &Request, tx: &mpsc::Sender<Event>) -> Result<StreamEn
                     }
                     "input_json_delta" => {
                         if let Some((call, _)) = &mut open_tool {
-                            call.arguments
-                                .push_str(value["delta"]["partial_json"].as_str().unwrap_or(""));
+                            let partial = value["delta"]["partial_json"].as_str().unwrap_or("");
+                            call.arguments.push_str(partial);
+                            if !partial.is_empty() {
+                                let _ = tx
+                                    .send(Event::ToolCallDelta {
+                                        bytes: partial.len() as u64,
+                                    })
+                                    .await;
+                            }
                         }
                     }
                     _ => {}

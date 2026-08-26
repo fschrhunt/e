@@ -85,9 +85,15 @@ async fn agent_runs_a_tool_then_replies() {
     let mut order = Vec::new();
     let mut reply = String::new();
     let mut tool_ok = false;
+    let mut assembly: Vec<u64> = Vec::new();
+    let mut assembly_before_batch = false;
     while let Some(event) = rx.recv().await {
         match event {
             SessionEvent::TurnStart => order.push("start"),
+            SessionEvent::ToolCallAssembly { bytes } => {
+                assembly_before_batch |= !order.contains(&"batch");
+                assembly.push(bytes);
+            }
             SessionEvent::ToolBatchStart { calls } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].running, "Reading");
@@ -110,6 +116,12 @@ async fn agent_runs_a_tool_then_replies() {
     assert_eq!(order, vec!["start", "batch", "tool", "end"]);
     assert!(tool_ok, "the read tool errored");
     assert_eq!(reply, "the file has two lines");
+    // Argument streaming is visible while it happens — cumulative byte
+    // counts, arriving before the batch opens, so a long tool call never
+    // looks like a stalled turn.
+    assert!(!assembly.is_empty(), "no ToolCallAssembly liveness events");
+    assert!(assembly.windows(2).all(|w| w[0] < w[1]) || assembly.len() == 1);
+    assert!(assembly_before_batch, "liveness must precede the batch");
 }
 
 #[allow(clippy::await_holding_lock)]

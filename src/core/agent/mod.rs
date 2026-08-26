@@ -151,6 +151,12 @@ pub enum SessionEvent {
         summary: String,
         content: String,
     },
+    /// Cumulative bytes of tool-call argument JSON streamed so far this
+    /// step. Argument assembly is the one long stream phase with no other
+    /// event — without this the UI freezes while the turn is alive.
+    ToolCallAssembly {
+        bytes: u64,
+    },
     /// An extension tool named the session.
     Named(String),
     Usage {
@@ -513,6 +519,11 @@ impl Agent {
                 // frame would let a consumer that sums per-step usage count
                 // the same tokens more than once.
                 let mut step_usage: Option<(u64, u64, u64)> = None;
+                // Cumulative argument bytes this attempt, for the liveness
+                // row. Deliberately not part of the retry-safety check: a
+                // partial call never left the dialect, so replaying the
+                // request commits nothing twice.
+                let mut assembly_bytes = 0u64;
                 let mut errored = false;
                 // True once this attempt has streamed anything at all — the
                 // signal both for "recovered" (first content after a retry)
@@ -566,6 +577,14 @@ impl Agent {
                             reasoning_streamed = true;
                             let _ = events.send(SessionEvent::ReasoningDelta(d)).await;
                         }
+                        ProviderEvent::ToolCallDelta { bytes } => {
+                            assembly_bytes += bytes;
+                            let _ = events
+                                .send(SessionEvent::ToolCallAssembly {
+                                    bytes: assembly_bytes,
+                                })
+                                .await;
+                        }
                         ProviderEvent::ToolCall(call) => calls.push(call),
                         ProviderEvent::ReasoningItem(item) => reasoning_items.push(item),
                         ProviderEvent::Usage {
@@ -609,6 +628,9 @@ impl Agent {
                                 let (nrx, nhandle) = providers::stream(clone_request(&request));
                                 rx = nrx;
                                 handle = nhandle;
+                                // A fresh attempt streams its arguments from
+                                // scratch; the liveness counter follows.
+                                assembly_bytes = 0;
                                 continue 'stream;
                             }
                             // Distinguish genuine exhaustion (the cause was

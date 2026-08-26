@@ -372,6 +372,8 @@ async fn collect_stream(
                 break;
             }
             Event::ReasoningItem(_) => {}
+            // Liveness progress; the accumulated call itself is asserted on.
+            Event::ToolCallDelta { .. } => {}
         }
     }
     (text, reasoning, calls, usage, finish)
