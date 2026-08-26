@@ -588,11 +588,10 @@ rl.on("line", (line) => {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn dead_extension_fails_fast_instead_of_stalling() {
-    // A valid script with no stdin reader: node drains its event loop and
-    // exits immediately, before e's initialize can be answered.
-    const DIES_INSTANTLY: &str = r#"#!/usr/bin/env node
-// no readline, no handlers — the process exits at once
-"#;
+    // A valid script with no stdin reader exits before initialize can be
+    // answered. Use the platform shell: cold-starting Node under a loaded CI
+    // runner can consume most of the timeout this test is trying to measure.
+    const DIES_INSTANTLY: &str = "#!/bin/sh\nexit 0\n";
     let _lock = env_lock();
     let _home = tempdir::TempHome::with_extension("dies.sh", DIES_INSTANTLY);
     let (notices, _rx) = tokio::sync::mpsc::channel(16);
