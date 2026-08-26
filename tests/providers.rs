@@ -698,6 +698,45 @@ async fn small_context_window_drops_thinking_instead_of_an_invalid_budget() {
     );
 }
 
+/// A model whose real output ceiling is below the Anthropic dialect's 32k
+/// default (declared via `max_output`, e.g. claude-haiku-4-5's ~8k) must
+/// have `max_tokens` clamped to that ceiling — otherwise the request 400s
+/// with a max_tokens-exceeds-limit error before generation.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn small_max_output_clamps_max_tokens_below_the_dialect_default() {
+    let _lock = env_lock();
+    let body = concat!(
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (port, server) = serve_sse(&[body]);
+    let home = Home::new("small-max-output");
+    home.auth(r#"{"anthropic":{"key":"sk-ant-test"}}"#);
+
+    let mut model = test_model("anthropic", port, Api::Anthropic);
+    model.thinking = Thinking::Manual;
+    model.context_window = 200_000; // half the window (100k) would otherwise clamp nothing
+    model.max_output = Some(8_192);
+    let request = Request {
+        model,
+        system: "be helpful".into(),
+        messages: vec![ChatMessage::user("hi")],
+        effort: None,
+        tools: Vec::new(),
+    };
+    let (_text, _reasoning, _calls, _usage, _finish) = collect_stream(request).await;
+
+    let sent = server.join().unwrap().remove(0);
+    assert_eq!(
+        request_json(&sent)["max_tokens"],
+        8_192,
+        "max_tokens must respect the model's own max_output, not the dialect's 32k default: {sent}"
+    );
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn responses_replays_reasoning_items_ahead_of_their_calls() {
@@ -913,6 +952,7 @@ fn registry_and_catalog_match_the_embedded_data() {
             assert_eq!(model.base_url, provider.base_url, "{}", decl.id);
             assert_eq!(model.api, provider.api(), "{}", decl.id);
             assert_eq!(model.context_window, decl.context_window, "{}", decl.id);
+            assert_eq!(model.max_output, decl.max_output, "{}", decl.id);
             assert_eq!(model.efforts, decl.efforts, "{}", decl.id);
             let thinking = match decl.thinking.as_deref() {
                 Some("adaptive") => Thinking::Adaptive,
@@ -985,6 +1025,16 @@ fn registry_and_catalog_match_the_embedded_data() {
         assert_eq!(thinking(id), Thinking::Adaptive, "{id} must be adaptive");
     }
     assert_eq!(thinking("claude-haiku-4-5"), Thinking::Manual);
+
+    let haiku = catalog
+        .iter()
+        .find(|m| m.provider == "anthropic" && m.id == "claude-haiku-4-5")
+        .unwrap();
+    assert_eq!(
+        haiku.max_output,
+        Some(8_192),
+        "haiku's real output ceiling is well under the Anthropic dialect's 32k default"
+    );
 }
 
 #[test]
@@ -1009,6 +1059,21 @@ fn models_json_windows_and_overrides() {
         find("big").context_window,
         1_000_000,
         "per-model wins over provider default"
+    );
+
+    let catalog = catalog_with_models_json(
+        r#"{"providers":{"anthropic":{"models":[
+            {"id":"claude-haiku-4-5","max_output":4096}
+        ]}}}"#,
+    );
+    let haiku = catalog
+        .iter()
+        .find(|m| m.provider == "anthropic" && m.id == "claude-haiku-4-5")
+        .unwrap();
+    assert_eq!(
+        haiku.max_output,
+        Some(4_096),
+        "a models.json override wins over the built-in max_output"
     );
 
     let catalog = catalog_with_models_json(
