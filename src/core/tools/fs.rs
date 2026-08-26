@@ -1,4 +1,4 @@
-//! Filesystem tools: read, write, ls, grep.
+//! Filesystem tools: read, write, grep.
 
 use serde_json::{json, Value};
 use std::path::Path;
@@ -154,40 +154,6 @@ pub fn write(args: &Value, cwd: &Path) -> ToolOutput {
         }
         Err(e) => err(format!("write {path}: {e}")),
     }
-}
-
-pub fn ls_schema() -> Value {
-    schema_object(
-        "ls",
-        "List a directory's entries.",
-        json!({"path": {"type": "string", "description": "Directory (default: workspace root)"}}),
-        &[],
-    )
-}
-
-pub fn ls(args: &Value, cwd: &Path) -> ToolOutput {
-    let path = args["path"].as_str().unwrap_or(".");
-    let full = resolve(cwd, path);
-    let entries = match std::fs::read_dir(&full) {
-        Ok(e) => e,
-        Err(e) => return err(format!("ls {path}: {e}")),
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if e.path().is_dir() {
-                format!("{name}/")
-            } else {
-                name
-            }
-        })
-        .collect();
-    names.sort();
-    let count = names.len();
-    // Bounded like every other tool: one giant vendored directory must not
-    // flood the context past the cap the rest of the tools respect.
-    ok(truncate(names.join("\n")), format!("{count} entries"))
 }
 
 pub fn grep_schema() -> Value {

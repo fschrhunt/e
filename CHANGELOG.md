@@ -8,6 +8,18 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- The built-in tool surface is the reference design's four plus grep: read ·
+  write · edit · grep · bash. `ls` and `find` are gone — bash covers both
+  without a schema riding along in every request — and the dedicated `skill`
+  tool is gone with them: the system-prompt catalog now advertises each
+  skill's name, description, and SKILL.md path, and the model pages a body
+  in with the ordinary `read` tool (the reference's progressive disclosure).
+  Fixes riding along: the `$` picker's injected skill now carries the same
+  skill-directory hint the tool path had, so a body that says "see
+  reference.md" no longer strands the model only when a human invoked it;
+  and a frontmatter `description:` may span lines (block scalars, indented
+  continuations) instead of silently truncating at the first newline.
+
 - Internal simplification, no behavior change: message commits go through
   one `TurnLog` handle instead of six threaded parameters; grep and find
   share one traversal (same skip rules, same cap semantics); each tool's

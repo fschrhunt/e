@@ -36,7 +36,9 @@ src/core/    the harness, terminal-free
                   embedded guides behind `e docs`)
   api/            the extension host: subprocesses over a JSONL line
                   protocol (docs/extensions.md) — tools, commands, hooks
-  tools/          read · write · edit · ls · grep · find · bash · skill
+  tools/          read · write · edit · grep · bash — the whole surface;
+                  directory listing and file-finding go through bash, and
+                  skills load through read (the catalog carries their paths)
   session.rs · output.rs · workspace.rs
 src/tui/     the frontend (short paths re-export from the groups)
   paint/          render · screen · theme · background · highlight

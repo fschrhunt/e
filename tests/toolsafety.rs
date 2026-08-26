@@ -157,8 +157,6 @@ fn search_tools_survive_a_symlink_cycle() {
 
     let grep = tools::run("grep", r#"{"pattern":"needle"}"#, &ws);
     assert_eq!(grep.summary, "1 matches", "{}", grep.content);
-    let find = tools::run("find", r#"{"pattern":"*.txt"}"#, &ws);
-    assert!(find.content.contains("real.txt"));
     let _ = std::fs::remove_dir_all(&ws);
 }
 
@@ -177,30 +175,9 @@ fn grep_searches_an_explicitly_requested_dotfile() {
     let _ = std::fs::remove_dir_all(&ws);
 }
 
-/// When the hit list alone is big enough to hit the 32KB output cap, the
-/// "stopped at N results" explanation must still survive — not get
+/// When the matched-line list alone is big enough to hit the 32KB output
+/// cap, the "stopped at N matches" explanation must still survive — not get
 /// overwritten by the generic byte-truncation marker.
-#[test]
-fn find_cap_notice_survives_the_output_truncation() {
-    let ws = workspace("find-cap");
-    let pad = "p".repeat(60);
-    for i in 0..600 {
-        std::fs::write(ws.join(format!("{pad}_{i:04}.txt")), "x").unwrap();
-    }
-    let out = tools::run("find", r#"{"pattern":"*.txt"}"#, &ws);
-    assert!(!out.is_error(), "{}", out.content);
-    assert_eq!(out.summary, "500+ files");
-    assert!(
-        out.content
-            .ends_with("… [stopped at 500 results — narrow the pattern or path to see the rest]"),
-        "cap notice missing or swallowed by truncation, tail was: {:?}",
-        &out.content[out.content.len().saturating_sub(120)..]
-    );
-    let _ = std::fs::remove_dir_all(&ws);
-}
-
-/// Same guarantee for grep: a big matched-line list must not swallow the
-/// "stopped at N matches" notice under the byte cap.
 #[test]
 fn grep_cap_notice_survives_the_output_truncation() {
     let ws = workspace("grep-cap");
