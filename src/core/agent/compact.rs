@@ -62,9 +62,12 @@ File paths, commands, data, or references needed to continue, or \"(none)\".
 
 Keep each section concise.";
 
-/// True when the session has grown into the reserve headroom.
+/// True when the session has grown into the reserve headroom. A window of 0
+/// (a broken user-declared model) never compacts: the threshold would sit at
+/// zero and every turn would end in a pointless compaction loop.
 pub fn should_compact(context_tokens: u64, context_window: u64) -> bool {
-    context_tokens > context_window.saturating_sub(reserve_tokens(context_window))
+    context_window > 0
+        && context_tokens > context_window.saturating_sub(reserve_tokens(context_window))
 }
 
 /// chars/4, the reference heuristic — conservative, and only used to place

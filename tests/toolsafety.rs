@@ -146,6 +146,22 @@ fn edit_fails_when_the_file_changed_on_disk_since_e_saw_it() {
     let _ = std::fs::remove_dir_all(&ws);
 }
 
+#[cfg(unix)]
+#[test]
+fn search_tools_survive_a_symlink_cycle() {
+    let ws = workspace("symlink");
+    std::fs::write(ws.join("real.txt"), "needle\n").unwrap();
+    // A directory symlink pointing back at its parent: following it would
+    // recurse forever.
+    std::os::unix::fs::symlink(&ws, ws.join("cycle")).unwrap();
+
+    let grep = tools::run("grep", r#"{"pattern":"needle"}"#, &ws);
+    assert_eq!(grep.summary, "1 matches", "{}", grep.content);
+    let find = tools::run("find", r#"{"pattern":"*.txt"}"#, &ws);
+    assert!(find.content.contains("real.txt"));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
 #[test]
 fn grep_searches_an_explicitly_requested_dotfile() {
     let ws = workspace("dotgrep");

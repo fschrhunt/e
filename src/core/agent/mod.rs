@@ -910,10 +910,13 @@ impl Agent {
                             "context nearly full — pausing to compact, then continuing".into(),
                         ))
                         .await;
+                    // Worded so it stays true even if the compaction the
+                    // frontend runs at TurnEnd fails — it must not claim a
+                    // compaction that may not have happened.
                     pending.lock().unwrap().insert(
                         0,
-                        "The context was compacted mid-task. Continue the task from where it \
-                         left off."
+                        "The turn was paused because the context ran low. Continue the task \
+                         from where it left off."
                             .into(),
                     );
                     break 'turn false;

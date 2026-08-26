@@ -505,15 +505,19 @@ fn walk_files(root: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
         if name.starts_with('.') || SKIP.contains(&name.as_str()) {
             continue;
         }
-        if path.is_dir() {
+        // Never follow symlinks: a link cycle (`ln -s . loop`) would recurse
+        // forever, and a link out of the tree would silently widen the walk.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             if !walk_files(&path, visit) {
                 return false;
             }
-        } else if std::fs::metadata(&path)
-            .map(|m| m.is_file())
-            .unwrap_or(false)
-            && !visit(&path)
-        {
+        } else if meta.is_file() && !visit(&path) {
             return false;
         }
     }
