@@ -24,6 +24,11 @@ use crate::core::providers::{
 use crate::core::session::Session;
 use crate::core::tools;
 
+/// Steps (provider requests, tool batches between them) one turn may run
+/// before it stops and asks to be continued. A backstop against a model
+/// stuck calling tools forever — set far above any legitimate turn.
+const MAX_STEPS: u32 = 256;
+
 /// Append a message to history and to the session log, creating the log on
 /// the first message. The in-memory turn always proceeds; a persistence
 /// failure comes back as the error so the caller can surface it — silently
@@ -436,9 +441,28 @@ impl Agent {
 
         tokio::spawn(async move {
             let _ = events.send(SessionEvent::TurnStart).await;
+            // One free retry for a blank success per turn: an empty stream is
+            // the most transient failure there is, and ending the turn on the
+            // first one traded a 1s pause for a dead turn.
+            let mut empty_retried = false;
+            // Steps this turn has run (one request each). The cap is a
+            // runaway backstop far above real work, not a working budget.
+            let mut steps = 0u32;
+            // Context size after the latest step, from real usage; 0 until a
+            // provider reports one.
+            let mut last_context = 0u64;
             let aborted = 'turn: loop {
                 if cancel.load(Ordering::SeqCst) {
                     break true;
+                }
+                steps += 1;
+                if steps > MAX_STEPS {
+                    let _ = events
+                        .send(SessionEvent::Warning(format!(
+                            "turn stopped after {MAX_STEPS} steps — send a message to continue"
+                        )))
+                        .await;
+                    break false;
                 }
                 // Steer: fold any pending messages into this turn between steps.
                 let steered: Vec<String> = { pending.lock().unwrap().drain(..).collect() };
@@ -483,6 +507,12 @@ impl Agent {
                 // thoughts on screen) and a thinking-only stream ending
                 // without text would be called an empty response.
                 let mut reasoning_streamed = false;
+                // Latest usage frame this step; emitted once after the stream
+                // ends. Dialects may report usage cumulatively mid-stream
+                // (Gemini sends usageMetadata per chunk), so forwarding every
+                // frame would let a consumer that sums per-step usage count
+                // the same tokens more than once.
+                let mut step_usage: Option<(u64, u64, u64)> = None;
                 let mut errored = false;
                 // True once this attempt has streamed anything at all — the
                 // signal both for "recovered" (first content after a retry)
@@ -492,12 +522,18 @@ impl Agent {
                 // prior `while let Some(event) = rx.recv()` only checked Esc
                 // after the next byte arrived, so a stalled SSE left the
                 // spinner running and Esc inert until the socket moved.
+                // Esc mid-stream falls through to the partial-commit path
+                // below instead of breaking the turn here: text the user
+                // watched stream must reach history, or the next turn's model
+                // has no memory of words the user is replying to.
+                let mut stream_cancelled = false;
                 'stream: loop {
                     let event = tokio::select! {
                         event = rx.recv() => event,
                         _ = wait_cancelled(&cancel) => {
                             handle.abort();
-                            break 'turn true;
+                            stream_cancelled = true;
+                            break 'stream;
                         }
                     };
                     let Some(event) = event else {
@@ -537,13 +573,7 @@ impl Agent {
                             output,
                             cache_read,
                         } => {
-                            let _ = events
-                                .send(SessionEvent::Usage {
-                                    input,
-                                    output,
-                                    cache_read,
-                                })
-                                .await;
+                            step_usage = Some((input, output, cache_read));
                         }
                         ProviderEvent::Error(err) => {
                             // Safe to retry only when the cause itself is
@@ -637,21 +667,119 @@ impl Agent {
                         }
                     }
                 }
-                if errored {
-                    break false;
+                // One Usage per step, the stream's final frame: `input` is
+                // this request's full context, `output` what this step alone
+                // generated. Emitted even when the stream then errored — the
+                // tokens were still consumed.
+                if let Some((input, output, cache_read)) = step_usage {
+                    last_context = input + output;
+                    let _ = events
+                        .send(SessionEvent::Usage {
+                            input,
+                            output,
+                            cache_read,
+                        })
+                        .await;
+                }
+                // A cancelled or failed stream still commits what it already
+                // produced: the user watched that text arrive, and a history
+                // missing it would have the model contradict its own visible
+                // words next turn. Calls that never ran get a synthetic
+                // result — a dangling tool_use without its tool_result fails
+                // the next request on every dialect.
+                if stream_cancelled || errored {
+                    if !text.is_empty() || !calls.is_empty() {
+                        for item in reasoning_items.drain(..) {
+                            let result = commit(
+                                &history,
+                                &session,
+                                &cwd,
+                                &model,
+                                ChatMessage {
+                                    role: "reasoning".into(),
+                                    content: item,
+                                    tool_calls: Vec::new(),
+                                    tool_call_id: None,
+                                    tool_meta: None,
+                                },
+                                &session_name,
+                            );
+                            note_persist(&persist_warned, result, &events);
+                        }
+                        let (note, outcome) = if stream_cancelled {
+                            (
+                                "not executed — the turn was cancelled before this call ran",
+                                tools::ToolOutcome::Cancelled,
+                            )
+                        } else {
+                            (
+                                "not executed — the provider stream failed before this call ran",
+                                tools::ToolOutcome::Failed,
+                            )
+                        };
+                        let unrun = calls.clone();
+                        let result = commit(
+                            &history,
+                            &session,
+                            &cwd,
+                            &model,
+                            ChatMessage::assistant(std::mem::take(&mut text), calls),
+                            &session_name,
+                        );
+                        note_persist(&persist_warned, result, &events);
+                        for call in unrun {
+                            let result = commit(
+                                &history,
+                                &session,
+                                &cwd,
+                                &model,
+                                ChatMessage::tool_result_with_meta(
+                                    call.id,
+                                    note,
+                                    outcome,
+                                    if stream_cancelled {
+                                        "cancelled"
+                                    } else {
+                                        "error"
+                                    },
+                                ),
+                                &session_name,
+                            );
+                            note_persist(&persist_warned, result, &events);
+                        }
+                    }
+                    break stream_cancelled;
                 }
 
                 // A stream that ends with no text, no calls, no reasoning,
                 // and no error is a blank success — committing it would strand
-                // the turn in silence. Abnormal finishes and skipped frames
-                // were already surfaced as warnings above; here we guarantee
-                // the user at least sees that something went wrong.
+                // the turn in silence. It is also the most transient failure
+                // a provider produces, so it gets one quiet re-request per
+                // turn before the error. Abnormal finishes and skipped frames
+                // were already surfaced as warnings above; past the retry we
+                // guarantee the user at least sees that something went wrong.
                 if text.is_empty()
                     && calls.is_empty()
                     && reasoning_items.is_empty()
                     && !reasoning_streamed
                     && pending.lock().unwrap().is_empty()
                 {
+                    if !empty_retried {
+                        empty_retried = true;
+                        let _ = events
+                            .send(SessionEvent::Retry {
+                                attempt: 2,
+                                limit: retry::MAX_ATTEMPTS,
+                                delay_secs: 1,
+                                cause: FailureCause::ProviderUnavailable,
+                                reason: "empty response".into(),
+                            })
+                            .await;
+                        if !sleep_cancellable(Duration::from_secs(1), &cancel).await {
+                            break 'turn true;
+                        }
+                        continue 'turn;
+                    }
                     let _ = events
                         .send(SessionEvent::Error(
                             "the model returned an empty response".into(),
@@ -754,7 +882,9 @@ impl Agent {
                                     id,
                                     outcome: output.outcome,
                                     summary: output.summary.clone(),
-                                    content: output.content.clone(),
+                                    // The viewer gets the rich detail (full
+                                    // diffs); history keeps the lean content.
+                                    content: output.display_text().to_string(),
                                 })
                                 .await;
                             output
@@ -775,6 +905,7 @@ impl Agent {
                                 content: "tool panicked".into(),
                                 outcome: tools::ToolOutcome::Failed,
                                 summary: "error".into(),
+                                display: None,
                             },
                         },
                         _ = wait_cancelled(&cancel) => tools::ToolOutput {
@@ -785,6 +916,7 @@ impl Agent {
                                 .into(),
                             outcome: tools::ToolOutcome::Cancelled,
                             summary: "cancelled".into(),
+                            display: None,
                         },
                     };
                     let result = commit(
@@ -804,6 +936,27 @@ impl Agent {
                 }
                 if cancel.load(Ordering::SeqCst) {
                     break 'turn true;
+                }
+                // Context guard: a long tool loop grows the context fastest
+                // exactly where compaction (which runs between turns) can't
+                // reach it, and the next request past the window dies on a
+                // rejected 400 with the work half-done. When real usage says
+                // the reserve is spent, end the turn cleanly instead — the
+                // frontend compacts at TurnEnd — and queue a continuation so
+                // the task resumes in the fresh context.
+                if last_context > 0 && compact::should_compact(last_context, model.context_window) {
+                    let _ = events
+                        .send(SessionEvent::Warning(
+                            "context nearly full — pausing to compact, then continuing".into(),
+                        ))
+                        .await;
+                    pending.lock().unwrap().insert(
+                        0,
+                        "The context was compacted mid-task. Continue the task from where it \
+                         left off."
+                            .into(),
+                    );
+                    break 'turn false;
                 }
             };
             let _ = events.send(SessionEvent::TurnEnd { aborted }).await;
@@ -857,6 +1010,7 @@ async fn run_tool(
                     content: "tool cancelled".into(),
                     outcome: tools::ToolOutcome::Cancelled,
                     summary: "cancelled".into(),
+                    display: None,
                 };
             }
         };
@@ -865,6 +1019,7 @@ async fn run_tool(
                 content: format!("Tool call blocked by extension: {reason}"),
                 outcome: tools::ToolOutcome::Blocked,
                 summary: "blocked".into(),
+                display: None,
             };
         }
         if h.owns_tool(name) {
@@ -889,6 +1044,7 @@ async fn run_tool(
                             content: result.content,
                             outcome,
                             summary: if outcome.is_error() { "error".into() } else { "done".into() },
+                            display: None,
                         };
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
@@ -897,6 +1053,7 @@ async fn run_tool(
                                 content: "extension tool cancelled".into(),
                                 outcome: tools::ToolOutcome::Cancelled,
                                 summary: "cancelled".into(),
+                                display: None,
                             };
                         }
                     }
@@ -923,5 +1080,6 @@ async fn run_tool(
         content: "tool panicked".into(),
         outcome: tools::ToolOutcome::Failed,
         summary: "error".into(),
+        display: None,
     })
 }

@@ -121,12 +121,23 @@ async fn compact_summarizes_and_seeds_a_fresh_session() {
 
 #[test]
 fn threshold_is_window_minus_reserve() {
-    use e::core::agent::compact::{should_compact, RESERVE_TOKENS};
+    use e::core::agent::compact::{
+        keep_recent_tokens, reserve_tokens, should_compact, RESERVE_TOKENS,
+    };
+    // Large windows keep the reference reserve.
     let window = 200_000u64;
+    assert_eq!(reserve_tokens(window), RESERVE_TOKENS);
     assert!(!should_compact(window - RESERVE_TOKENS, window));
     assert!(should_compact(window - RESERVE_TOKENS + 1, window));
+    // Small windows scale: a 32k local model must not spend half its context
+    // on a reserve tuned for 200k, and the keep budget must stay well under
+    // the window or compaction becomes a no-op exactly where it matters.
+    assert_eq!(reserve_tokens(32_000), 4_000);
+    assert!(keep_recent_tokens(32_000) < 32_000 / 2);
+    assert!(should_compact(29_000, 32_000));
+    assert!(!should_compact(20_000, 32_000));
     // A tiny window never underflows.
-    assert!(should_compact(1, RESERVE_TOKENS / 2));
+    assert!(should_compact(1_900, 2_000));
 }
 
 #[test]
@@ -135,7 +146,7 @@ fn split_spares_small_histories() {
         ChatMessage::user("hi"),
         ChatMessage::assistant("hello", Vec::new()),
     ];
-    let (to_summarize, kept) = e::core::agent::compact::split(&history);
+    let (to_summarize, kept) = e::core::agent::compact::split(&history, 200_000);
     assert!(to_summarize.is_empty());
     assert_eq!(kept.len(), 2);
 }
@@ -162,7 +173,7 @@ fn split_never_cuts_at_a_tool_result() {
         ChatMessage::tool_result("c1", &big),
         ChatMessage::assistant("done", Vec::new()),
     ];
-    let (to_summarize, kept) = e::core::agent::compact::split(&history);
+    let (to_summarize, kept) = e::core::agent::compact::split(&history, 200_000);
     assert_eq!(
         kept.len(),
         1,
@@ -202,7 +213,7 @@ fn split_never_separates_signed_thinking_from_its_assistant_turn() {
         ChatMessage::tool_result("c1", "ok"),
         ChatMessage::assistant("done", Vec::new()),
     ];
-    let (to_summarize, kept) = e::core::agent::compact::split(&history);
+    let (to_summarize, kept) = e::core::agent::compact::split(&history, 200_000);
     // A cut happened, and the signed block stayed with its turn: either both
     // were summarized away or both remain in the kept tail, adjacent.
     let reasoning_kept = kept.iter().any(|m| m.role == "reasoning");
@@ -264,6 +275,19 @@ fn failed_fresh_log_keeps_the_old_session_attached() {
     let slug_dir = old_path.parent().unwrap();
     let before = std::fs::metadata(slug_dir).unwrap().permissions();
     std::fs::set_permissions(slug_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Probe that the fault actually took: root (CI containers, sandboxes)
+    // ignores directory permissions, and then the failure this test pins
+    // cannot be injected at all — skip rather than fail on a fault that
+    // didn't happen.
+    let probe = slug_dir.join(".probe");
+    if std::fs::write(&probe, b"x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(slug_dir, before).unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ws);
+        eprintln!("skipped: permission-based fault injection is inert for this user");
+        return;
+    }
 
     agent.load_compacted("Goal: continue.", vec![ChatMessage::user("recent turn")]);
 

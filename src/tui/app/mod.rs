@@ -45,9 +45,6 @@ struct ActiveTurn {
     tool_blocks: std::collections::HashMap<u64, usize>,
     /// Batch members not yet terminal, including serially pending calls.
     pending_tools: usize,
-    /// False until the provider's first real Usage lands; the seed estimate
-    /// fills the counters before that.
-    usage_seen: bool,
 }
 
 /// The ctrl+o full-detail screen: one stored output at a time, scrollable,
@@ -1258,7 +1255,6 @@ impl App {
                     error: None,
                     tool_blocks: std::collections::HashMap::new(),
                     pending_tools: 0,
-                    usage_seen: false,
                 });
                 // Seed the token counters from request size so the activity
                 // row shows ↑ from the first second, like the reference.
@@ -1437,16 +1433,14 @@ impl App {
                 // count and trigger compaction early.
                 self.context_tokens = input + output;
                 if let Some(s) = &mut self.active {
-                    // The seed estimate holds the counters until the first
-                    // real usage lands; from then on, accumulate per step.
-                    if s.usage_seen {
-                        s.turn.input += input;
-                        s.turn.output += output;
-                    } else {
-                        s.turn.input = input;
-                        s.turn.output = output;
-                        s.usage_seen = true;
-                    }
+                    // Every step resends the whole context, so `input` is the
+                    // latest request's size, not new work — summing it across
+                    // steps re-counted the same tokens once per step and
+                    // showed absurd totals for long tool loops. Latest wins
+                    // (displacing the seed estimate); only `output` — the
+                    // tokens each step actually generated — accumulates.
+                    s.turn.input = input;
+                    s.turn.output += output;
                 }
             }
             SessionEvent::Retry {
@@ -1601,7 +1595,8 @@ impl App {
             self.notice("nothing to compact yet".into());
             return;
         }
-        let (to_summarize, kept) = crate::core::agent::compact::split(&history);
+        let (to_summarize, kept) =
+            crate::core::agent::compact::split(&history, self.agent.model.context_window);
         if to_summarize.is_empty() {
             if !auto {
                 self.notice("recent context already fits — nothing to compact".into());
@@ -1647,6 +1642,7 @@ impl App {
                 content: "shell command panicked".into(),
                 outcome: crate::core::tools::ToolOutcome::Failed,
                 summary: "error".into(),
+                display: None,
             });
             let _ = results.send(AppJob::Shell { cmd, output, epoch }).await;
         });

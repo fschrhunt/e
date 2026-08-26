@@ -8,6 +8,70 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- Turn token accounting is honest: the trailer's ↑ used to sum every step's
+  full context (a 20-step turn over a 100k context showed ↑2000k); it now
+  shows the request size (latest wins) while ↓ keeps accumulating what each
+  step actually generated. The agent emits exactly one Usage event per step
+  — the stream's final frame — so dialects that report usage cumulatively
+  mid-stream can't be double-counted either.
+- Tool results stop echoing content the model just wrote: `write` and
+  `edit` return a one-line confirmation to the model (the full diff moves
+  to the ctrl+o detail viewer via a new display channel on `ToolOutput`),
+  ending the pattern where every written file was billed into the context
+  twice and then re-sent with every later request.
+- `bash` keeps the *tail* of over-long output instead of the head — the
+  verdict of a compile or test run lives at the end — with the truncation
+  marker up front; ANSI escape sequences are stripped from the model's copy
+  and carriage-return progress bars collapse to their final frame.
+  `sanitize_display` now removes whole CSI/OSC sequences instead of leaving
+  `]0;…`/`[31m` fragments behind.
+- `read` returns line-numbered lines (`N<tab>…`), so the model can
+  correlate compiler line numbers with file content and knows where a
+  windowed read sits; `edit`'s description warns the prefix is not file
+  text.
+- Silent caps now speak: `grep` marks a result stopped at its 200-match cap
+  (`200+ matches`) and documents its traversal skips; `ls` output is
+  bounded like every other tool; broken tool-argument JSON is reported as
+  invalid JSON instead of a misleading "missing <param>".
+- New `find` tool: filename search with `*`/`?`/`**` globs, grep's
+  traversal rules, and a capped-result marker — locating a file by name no
+  longer needs bash gymnastics.
+- `edit` and `write` fail with "changed on disk" when the target changed
+  since e last read or wrote it (a user's editor, a bash `sed -i`), instead
+  of silently clobbering the newer copy from a stale read.
+- Anthropic prompt caching actually covers the conversation: a moving
+  `cache_control` breakpoint rides the last message, so each tool-loop step
+  extends the previous step's cached prefix instead of re-billing the whole
+  history uncached; `max_tokens` (and the manual thinking budget) clamp to
+  the model's declared window.
+- The system prompt carries an environment tail — platform and today's UTC
+  date — so the model stops guessing dates from its training cutoff; the
+  `skill` tool result names the skill's directory so bodies can reference
+  their bundled files.
+- Turn robustness: text the user watched stream is committed to history
+  when a stream errors or Esc lands mid-reply (calls that never ran get an
+  honest synthetic result, keeping the history replayable); a blank
+  successful stream gets one quiet re-request before the error; a
+  provider's `Retry-After` is honored up to 60s instead of being clamped to
+  30s and burning attempts; a 256-step backstop stops runaway tool loops.
+- Mid-turn context guard: when real usage crosses the compaction threshold
+  inside a tool loop, the turn ends cleanly with a queued continuation
+  instead of dying on a rejected over-window request — the frontend
+  compacts between turns as before, then resumes the task.
+- Compaction thresholds scale with the window (reserve an eighth, keep a
+  quarter, both bounded at the reference values) so a 32k local model no
+  longer compacts at half its context or keeps more than the whole window;
+  the summarize request budgets its flattened transcript to half the
+  window, dropping the oldest messages with a marker, instead of
+  overflowing at the exact moment compaction is needed.
+- Session resume tolerates a torn final line (the artifact of a crash
+  mid-append) by dropping that one record instead of refusing the whole
+  session, and repairs a tail cut between a tool call and its result with a
+  synthetic "not executed" result so the history replays on every dialect.
+  Interior corruption stays a hard error.
+- SECURITY.md states explicitly that directory trust gates context
+  injection (AGENTS.md, repo skills/prompts), not execution.
+
 - Gemini thought deltas count as a produced stream: a thinking-only turn
   that ends without text (MAX_TOKENS mid-thought) now ends with the
   truncation warning instead of a spurious "empty response" error, and a

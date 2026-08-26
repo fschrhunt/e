@@ -36,7 +36,7 @@ src/core/    the harness, terminal-free
                   embedded guides behind `e docs`)
   api/            the extension host: subprocesses over a JSONL line
                   protocol (docs/extensions.md) — tools, commands, hooks
-  tools/          read · write · edit · ls · grep · bash · skill
+  tools/          read · write · edit · ls · grep · find · bash · skill
   session.rs · output.rs · workspace.rs
 src/tui/     the frontend (short paths re-export from the groups)
   paint/          render · screen · theme · background · highlight
