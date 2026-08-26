@@ -44,7 +44,20 @@ pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
     let by_name = !pattern.contains('/');
     let root = resolve(cwd, args["path"].as_str().unwrap_or("."));
     let mut hits: Vec<String> = Vec::new();
-    walk(&root, cwd, &re, by_name, &mut hits);
+    super::walk_files(&root, &mut |path| {
+        let rel = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
+        let candidate = if by_name {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            rel.clone()
+        };
+        if re.is_match(&candidate) {
+            hits.push(rel);
+        }
+        hits.len() < RESULT_CAP
+    });
     hits.sort();
     let count = hits.len();
     let mut body = hits.join("\n");
@@ -61,42 +74,6 @@ pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
         outcome: ToolOutcome::Completed,
         summary,
         display: None,
-    }
-}
-
-fn walk(dir: &Path, cwd: &Path, re: &regex::Regex, by_name: bool, hits: &mut Vec<String>) {
-    const SKIP: &[&str] = &[".git", "target", "node_modules", "dist", ".cache"];
-    if hits.len() >= RESULT_CAP {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e.flatten().map(|e| e.path()).collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    for path in entries {
-        if hits.len() >= RESULT_CAP {
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.starts_with('.') || SKIP.contains(&name.as_str()) {
-            continue;
-        }
-        if path.is_dir() {
-            walk(&path, cwd, re, by_name, hits);
-            continue;
-        }
-        let rel = path
-            .strip_prefix(cwd)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        let candidate = if by_name { name.as_str() } else { rel.as_str() };
-        if re.is_match(candidate) {
-            hits.push(rel);
-        }
     }
 }
 

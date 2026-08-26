@@ -68,6 +68,17 @@ impl ChatMessage {
             tool_meta: None,
         }
     }
+    /// A dialect-owned reasoning item (signed thinking block, Responses
+    /// reasoning JSON) that must replay ahead of its assistant turn.
+    pub fn reasoning(item: impl Into<String>) -> Self {
+        ChatMessage {
+            role: "reasoning".into(),
+            content: item.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_meta: None,
+        }
+    }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
         ChatMessage {
             role: "tool".into(),

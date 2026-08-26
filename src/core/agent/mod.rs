@@ -29,34 +29,49 @@ use crate::core::tools;
 /// stuck calling tools forever — set far above any legitimate turn.
 const MAX_STEPS: u32 = 256;
 
-/// Append a message to history and to the session log, creating the log on
-/// the first message. The in-memory turn always proceeds; a persistence
-/// failure comes back as the error so the caller can surface it — silently
-/// losing history is the one thing this must never do.
-fn commit(
-    history: &Arc<Mutex<Vec<ChatMessage>>>,
-    session: &Arc<Mutex<Option<Session>>>,
-    cwd: &std::path::Path,
-    model: &Model,
-    message: ChatMessage,
-    session_name: &Arc<Mutex<Option<String>>>,
-) -> std::io::Result<()> {
-    history.lock().unwrap().push(message.clone());
-    let mut guard = session.lock().unwrap();
-    if guard.is_none() {
-        let mut created = Session::create(cwd, &slug(model))?;
-        // A pending name applies before the first record. It is best-effort:
-        // failing here must not discard the freshly created log — dropping it
-        // would make the next commit open a different file and strand every
-        // message already in memory outside any session.
-        if let Some(name) = session_name.lock().unwrap().clone() {
-            let _ = created.set_name(&name);
-        }
-        *guard = Some(created);
+/// One handle for everything a commit needs — history, the session log, and
+/// the persistence-warning latch — so the turn loop appends a message with
+/// one call instead of threading six parameters through every site.
+#[derive(Clone)]
+struct TurnLog {
+    history: Arc<Mutex<Vec<ChatMessage>>>,
+    session: Arc<Mutex<Option<Session>>>,
+    cwd: PathBuf,
+    model: Model,
+    session_name: Arc<Mutex<Option<String>>>,
+    persist_warned: Arc<AtomicBool>,
+    events: mpsc::Sender<SessionEvent>,
+}
+
+impl TurnLog {
+    /// Append a message to history and to the session log, creating the log
+    /// on the first message. The in-memory turn always proceeds; a
+    /// persistence failure warns once per episode (see `note_persist`) —
+    /// silently losing history is the one thing this must never do.
+    fn commit(&self, message: ChatMessage) {
+        let result = self.append(message);
+        note_persist(&self.persist_warned, result, &self.events);
     }
-    match guard.as_mut() {
-        Some(s) => s.append(&message),
-        None => Ok(()),
+
+    fn append(&self, message: ChatMessage) -> std::io::Result<()> {
+        self.history.lock().unwrap().push(message.clone());
+        let mut guard = self.session.lock().unwrap();
+        if guard.is_none() {
+            let mut created = Session::create(&self.cwd, &slug(&self.model))?;
+            // A pending name applies before the first record. It is
+            // best-effort: failing here must not discard the freshly created
+            // log — dropping it would make the next commit open a different
+            // file and strand every message already in memory outside any
+            // session.
+            if let Some(name) = self.session_name.lock().unwrap().clone() {
+                let _ = created.set_name(&name);
+            }
+            *guard = Some(created);
+        }
+        match guard.as_mut() {
+            Some(s) => s.append(&message),
+            None => Ok(()),
+        }
     }
 }
 
@@ -306,19 +321,25 @@ impl Agent {
         self.history.lock().unwrap().clear();
     }
 
+    /// The commit handle over this agent's history, session, and warning
+    /// latch — the one way messages enter the record.
+    fn log(&self) -> TurnLog {
+        TurnLog {
+            history: self.history.clone(),
+            session: self.session.clone(),
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            session_name: self.session_name.clone(),
+            persist_warned: self.persist_warned.clone(),
+            events: self.events.clone(),
+        }
+    }
+
     /// Commit a user-visible fact into history and the session log without
     /// starting a turn — the `!` shell passthrough records its output this way
     /// so the model sees what the user ran.
     pub fn record_user(&self, text: String) {
-        let result = commit(
-            &self.history,
-            &self.session,
-            &self.cwd,
-            &self.model,
-            ChatMessage::user(text),
-            &self.session_name,
-        );
-        note_persist(&self.persist_warned, result, &self.events);
+        self.log().commit(ChatMessage::user(text));
     }
 
     /// Replace the history with the compaction seed plus the kept recent
@@ -415,15 +436,7 @@ impl Agent {
             self.pending.lock().unwrap().push(text);
             return true;
         }
-        let result = commit(
-            &self.history,
-            &self.session,
-            &self.cwd,
-            &self.model,
-            ChatMessage::user(text),
-            &self.session_name,
-        );
-        note_persist(&self.persist_warned, result, &self.events);
+        self.log().commit(ChatMessage::user(text));
         self.start(system);
         false
     }
@@ -431,6 +444,7 @@ impl Agent {
     fn start(&mut self, system: String) {
         self.running = true;
         self.cancel.store(false, Ordering::SeqCst);
+        let log = self.log();
         let events = self.events.clone();
         let history = self.history.clone();
 
@@ -438,11 +452,8 @@ impl Agent {
         let model = self.model.clone();
         let cwd = self.cwd.clone();
         let effort = self.effort();
-        let session = self.session.clone();
         let pending = self.pending.clone();
         let host = self.host.clone();
-        let session_name = self.session_name.clone();
-        let persist_warned = self.persist_warned.clone();
         let tool_seq = self.tool_seq.clone();
 
         tokio::spawn(async move {
@@ -474,15 +485,7 @@ impl Agent {
                 let steered: Vec<String> = { pending.lock().unwrap().drain(..).collect() };
                 for message in steered {
                     let _ = events.send(SessionEvent::Steered(message.clone())).await;
-                    let result = commit(
-                        &history,
-                        &session,
-                        &cwd,
-                        &model,
-                        ChatMessage::user(message),
-                        &session_name,
-                    );
-                    note_persist(&persist_warned, result, &events);
+                    log.commit(ChatMessage::user(message));
                 }
 
                 let messages = { history.lock().unwrap().clone() };
@@ -712,62 +715,27 @@ impl Agent {
                 if stream_cancelled || errored {
                     if !text.is_empty() || !calls.is_empty() {
                         for item in reasoning_items.drain(..) {
-                            let result = commit(
-                                &history,
-                                &session,
-                                &cwd,
-                                &model,
-                                ChatMessage {
-                                    role: "reasoning".into(),
-                                    content: item,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_meta: None,
-                                },
-                                &session_name,
-                            );
-                            note_persist(&persist_warned, result, &events);
+                            log.commit(ChatMessage::reasoning(item));
                         }
-                        let (note, outcome) = if stream_cancelled {
+                        let (note, outcome, summary) = if stream_cancelled {
                             (
                                 "not executed — the turn was cancelled before this call ran",
                                 tools::ToolOutcome::Cancelled,
+                                "cancelled",
                             )
                         } else {
                             (
                                 "not executed — the provider stream failed before this call ran",
                                 tools::ToolOutcome::Failed,
+                                "error",
                             )
                         };
                         let unrun = calls.clone();
-                        let result = commit(
-                            &history,
-                            &session,
-                            &cwd,
-                            &model,
-                            ChatMessage::assistant(std::mem::take(&mut text), calls),
-                            &session_name,
-                        );
-                        note_persist(&persist_warned, result, &events);
+                        log.commit(ChatMessage::assistant(std::mem::take(&mut text), calls));
                         for call in unrun {
-                            let result = commit(
-                                &history,
-                                &session,
-                                &cwd,
-                                &model,
-                                ChatMessage::tool_result_with_meta(
-                                    call.id,
-                                    note,
-                                    outcome,
-                                    if stream_cancelled {
-                                        "cancelled"
-                                    } else {
-                                        "error"
-                                    },
-                                ),
-                                &session_name,
-                            );
-                            note_persist(&persist_warned, result, &events);
+                            log.commit(ChatMessage::tool_result_with_meta(
+                                call.id, note, outcome, summary,
+                            ));
                         }
                     }
                     break stream_cancelled;
@@ -813,32 +781,10 @@ impl Agent {
                 // Reasoning items commit first — the dialect that produced
                 // them must replay them ahead of the assistant turn.
                 for item in reasoning_items.drain(..) {
-                    let result = commit(
-                        &history,
-                        &session,
-                        &cwd,
-                        &model,
-                        ChatMessage {
-                            role: "reasoning".into(),
-                            content: item,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_meta: None,
-                        },
-                        &session_name,
-                    );
-                    note_persist(&persist_warned, result, &events);
+                    log.commit(ChatMessage::reasoning(item));
                 }
                 // Commit the assistant turn (text + any calls).
-                let result = commit(
-                    &history,
-                    &session,
-                    &cwd,
-                    &model,
-                    ChatMessage::assistant(text, calls.clone()),
-                    &session_name,
-                );
-                note_persist(&persist_warned, result, &events);
+                log.commit(ChatMessage::assistant(text, calls.clone()));
 
                 if calls.is_empty() {
                     // A plain reply would end the turn — but a message that
@@ -941,20 +887,12 @@ impl Agent {
                             display: None,
                         },
                     };
-                    let result = commit(
-                        &history,
-                        &session,
-                        &cwd,
-                        &model,
-                        ChatMessage::tool_result_with_meta(
-                            call.id,
-                            output.content,
-                            output.outcome,
-                            output.summary,
-                        ),
-                        &session_name,
-                    );
-                    note_persist(&persist_warned, result, &events);
+                    log.commit(ChatMessage::tool_result_with_meta(
+                        call.id,
+                        output.content,
+                        output.outcome,
+                        output.summary,
+                    ));
                 }
                 if cancel.load(Ordering::SeqCst) {
                     break 'turn true;
@@ -1045,42 +983,39 @@ async fn run_tool(
             };
         }
         if h.owns_tool(name) {
-            let call = h.call_tool(name, arguments);
-            tokio::pin!(call);
-            loop {
-                tokio::select! {
-                    result = &mut call => {
-                        // An extension tool may name the session as a side
-                        // effect; the UI applies it on SessionEvent::Named.
-                        if let Some(new_name) = result.session_name.clone() {
-                            let _ = events
-                                .send(SessionEvent::Named(new_name))
-                                .await;
-                        }
-                        let outcome = if result.is_error {
-                            tools::ToolOutcome::Failed
-                        } else {
-                            tools::ToolOutcome::Completed
-                        };
-                        return tools::ToolOutput {
-                            content: result.content,
-                            outcome,
-                            summary: if outcome.is_error() { "error".into() } else { "done".into() },
-                            display: None,
-                        };
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
-                        if cancel.load(Ordering::SeqCst) {
-                            return tools::ToolOutput {
-                                content: "extension tool cancelled".into(),
-                                outcome: tools::ToolOutcome::Cancelled,
-                                summary: "cancelled".into(),
-                                display: None,
-                            };
-                        }
-                    }
+            // Same race as the hook above: the call against the cancel flag,
+            // through the one shared helper — not a second hand-rolled poll.
+            let result = tokio::select! {
+                result = h.call_tool(name, arguments) => result,
+                _ = wait_cancelled(&cancel) => {
+                    return tools::ToolOutput {
+                        content: "extension tool cancelled".into(),
+                        outcome: tools::ToolOutcome::Cancelled,
+                        summary: "cancelled".into(),
+                        display: None,
+                    };
                 }
+            };
+            // An extension tool may name the session as a side effect; the
+            // UI applies it on SessionEvent::Named.
+            if let Some(new_name) = result.session_name.clone() {
+                let _ = events.send(SessionEvent::Named(new_name)).await;
             }
+            let outcome = if result.is_error {
+                tools::ToolOutcome::Failed
+            } else {
+                tools::ToolOutcome::Completed
+            };
+            return tools::ToolOutput {
+                content: result.content,
+                outcome,
+                summary: if outcome.is_error() {
+                    "error".into()
+                } else {
+                    "done".into()
+                },
+                display: None,
+            };
         }
     }
     let name = name.to_string();

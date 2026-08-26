@@ -97,68 +97,56 @@ pub struct Presentation {
 
 /// Resolve state-aware labels without throwing away workspace-relative paths.
 pub fn present(name: &str, args: &Value) -> Presentation {
-    let path = || sanitize_inline(args["path"].as_str().unwrap_or(""));
-    let command = || sanitize_inline(args["command"].as_str().unwrap_or(""));
-    match name {
-        "read" => Presentation {
-            category: "read".into(),
-            running: "Reading".into(),
-            completed: "Read".into(),
-            target: path(),
+    match SPECS.iter().find(|s| s.name == name) {
+        Some(spec) => Presentation {
+            category: spec.category.into(),
+            running: spec.running.into(),
+            completed: spec.completed.into(),
+            target: (spec.target)(args),
         },
-        "write" => Presentation {
-            category: "write".into(),
-            running: "Writing".into(),
-            completed: "Wrote".into(),
-            target: path(),
-        },
-        "edit" => Presentation {
-            category: "edit".into(),
-            running: "Editing".into(),
-            completed: "Edited".into(),
-            target: path(),
-        },
-        "bash" => Presentation {
-            category: "command".into(),
-            running: "Running".into(),
-            completed: "Ran".into(),
-            target: command(),
-        },
-        "grep" => Presentation {
-            category: "search".into(),
-            running: "Searching".into(),
-            completed: "Searched".into(),
-            target: sanitize_inline(args["pattern"].as_str().unwrap_or("")),
-        },
-        "find" => Presentation {
-            category: "search".into(),
-            running: "Finding".into(),
-            completed: "Found".into(),
-            target: sanitize_inline(args["pattern"].as_str().unwrap_or("")),
-        },
-        "ls" => Presentation {
-            category: "list".into(),
-            running: "Listing".into(),
-            completed: "Listed".into(),
-            target: sanitize_inline(args["path"].as_str().unwrap_or(".")),
-        },
-        "skill" => Presentation {
-            category: "skill".into(),
-            running: "Loading".into(),
-            completed: "Loaded".into(),
-            target: sanitize_inline(args["name"].as_str().unwrap_or("")),
-        },
-        other => Presentation {
-            category: other.into(),
-            running: format!("Running {other}"),
-            completed: format!("Ran {other}"),
+        None => Presentation {
+            category: name.into(),
+            running: format!("Running {name}"),
+            completed: format!("Ran {name}"),
             target: String::new(),
         },
     }
 }
 
+/// `(name, one-line description)` for the system prompt's tools list.
+pub fn snippets() -> impl Iterator<Item = (&'static str, &'static str)> {
+    SPECS.iter().map(|s| (s.name, s.snippet))
+}
+
+fn target_path(args: &Value) -> String {
+    sanitize_inline(args["path"].as_str().unwrap_or(""))
+}
+fn target_dir(args: &Value) -> String {
+    sanitize_inline(args["path"].as_str().unwrap_or("."))
+}
+fn target_command(args: &Value) -> String {
+    sanitize_inline(args["command"].as_str().unwrap_or(""))
+}
+fn target_pattern(args: &Value) -> String {
+    sanitize_inline(args["pattern"].as_str().unwrap_or(""))
+}
+fn target_name(args: &Value) -> String {
+    sanitize_inline(args["name"].as_str().unwrap_or(""))
+}
+
+/// Everything a built-in tool is, in one row: schema and runner, the
+/// system-prompt one-liner, and the transcript's lifecycle labels. One
+/// table so adding a tool cannot leave the prompt, the presentation, or the
+/// dispatcher out of sync.
 struct Spec {
     name: &'static str,
+    /// One-line description for the system prompt's Available-tools list.
+    snippet: &'static str,
+    category: &'static str,
+    running: &'static str,
+    completed: &'static str,
+    /// Project the transcript target out of the call arguments.
+    target: fn(&Value) -> String,
     schema: fn() -> Value,
     run: fn(&Value, &Path) -> ToolOutput,
 }
@@ -166,41 +154,81 @@ struct Spec {
 static SPECS: &[Spec] = &[
     Spec {
         name: "read",
+        snippet: "Read the contents of a file. Use offset/limit for large files.",
+        category: "read",
+        running: "Reading",
+        completed: "Read",
+        target: target_path,
         schema: fs::read_schema,
         run: fs::read,
     },
     Spec {
         name: "write",
+        snippet: "Write content to a file, creating it if needed, overwriting if it exists.",
+        category: "write",
+        running: "Writing",
+        completed: "Wrote",
+        target: target_path,
         schema: fs::write_schema,
         run: fs::write,
     },
     Spec {
         name: "edit",
+        snippet: "Replace an exact string in a file; the old text must match once.",
+        category: "edit",
+        running: "Editing",
+        completed: "Edited",
+        target: target_path,
         schema: edit::schema,
         run: edit::run,
     },
     Spec {
         name: "ls",
+        snippet: "List the entries of a directory.",
+        category: "list",
+        running: "Listing",
+        completed: "Listed",
+        target: target_dir,
         schema: fs::ls_schema,
         run: fs::ls,
     },
     Spec {
         name: "grep",
+        snippet: "Search file contents by regular expression across the workspace.",
+        category: "search",
+        running: "Searching",
+        completed: "Searched",
+        target: target_pattern,
         schema: fs::grep_schema,
         run: fs::grep,
     },
     Spec {
         name: "find",
+        snippet: "Find files by name with a glob pattern (`*`, `?`, `**`).",
+        category: "search",
+        running: "Finding",
+        completed: "Found",
+        target: target_pattern,
         schema: find::schema,
         run: find::run,
     },
     Spec {
         name: "bash",
+        snippet: "Execute a bash command in the workspace root. Each call is a fresh shell — cd and variables don't persist.",
+        category: "command",
+        running: "Running",
+        completed: "Ran",
+        target: target_command,
         schema: bash::schema,
         run: bash::run,
     },
     Spec {
         name: "skill",
+        snippet: "Load a skill's instructions by name when a listed skill fits the task.",
+        category: "skill",
+        running: "Loading",
+        completed: "Loaded",
+        target: target_name,
         schema: skill::schema,
         run: skill::run,
     },
@@ -455,6 +483,41 @@ fn check_fresh(path: &Path, tool: &str, shown: &str) -> Result<(), ToolOutput> {
         summary: "stale".into(),
         display: None,
     })
+}
+
+/// Depth-first walk under `root` with the shared traversal rules — dotfiles
+/// and the build/vendor directories are skipped, only regular files are
+/// visited (a FIFO in the tree would hang the walk). `visit` returns false
+/// to stop early (a result cap); the walk then unwinds immediately.
+/// The one traversal for every file-scanning tool: grep and find diverging
+/// on skip rules would make "no matches" mean different things per tool.
+fn walk_files(root: &Path, visit: &mut dyn FnMut(&Path) -> bool) -> bool {
+    const SKIP: &[&str] = &[".git", "target", "node_modules", "dist", ".cache"];
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e.flatten().map(|e| e.path()).collect::<Vec<_>>(),
+        Err(_) => return true,
+    };
+    for path in entries {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        if path.is_dir() {
+            if !walk_files(&path, visit) {
+                return false;
+            }
+        } else if std::fs::metadata(&path)
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+            && !visit(&path)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve a possibly-relative path against the workspace root.

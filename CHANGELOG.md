@@ -8,6 +8,17 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- Internal simplification, no behavior change: message commits go through
+  one `TurnLog` handle instead of six threaded parameters; grep and find
+  share one traversal (same skip rules, same cap semantics); each tool's
+  schema, runner, system-prompt snippet, and transcript labels live in one
+  table so they cannot drift apart; tool cancellation uses one shared
+  helper; the TUI's session-event handling, menus, and login flows moved
+  into their own modules under `src/tui/app/`; the compact and toolloop
+  tests use the shared `tests/common` fixtures; a stray `screen.rs.bak`
+  was removed. A `CLAUDE.md` pointer and per-area test recipes in
+  `AGENTS.md` were added for agents working on e.
+
 - Tool-call assembly is visible while it streams: the one long stream phase
   with no text — a model writing a large `write` call generates argument
   JSON for tens of seconds — used to freeze the transcript and the token

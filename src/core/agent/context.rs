@@ -12,39 +12,6 @@ use std::path::Path;
 
 use crate::core::config::home;
 
-/// One-line description of each tool, for the Available tools list.
-const TOOL_SNIPPETS: &[(&str, &str)] = &[
-    (
-        "read",
-        "Read the contents of a file. Use offset/limit for large files.",
-    ),
-    (
-        "write",
-        "Write content to a file, creating it if needed, overwriting if it exists.",
-    ),
-    (
-        "edit",
-        "Replace an exact string in a file; the old text must match once.",
-    ),
-    ("ls", "List the entries of a directory."),
-    (
-        "grep",
-        "Search file contents by regular expression across the workspace.",
-    ),
-    (
-        "find",
-        "Find files by name with a glob pattern (`*`, `?`, `**`).",
-    ),
-    (
-        "bash",
-        "Execute a bash command in the workspace root. Each call is a fresh shell — cd and variables don't persist.",
-    ),
-    (
-        "skill",
-        "Load a skill's instructions by name when a listed skill fits the task.",
-    ),
-];
-
 const GUIDELINES: &[&str] = &[
     "Prefer small, focused changes; preserve unrelated code and formatting",
     "Show file paths clearly when working with files",
@@ -55,8 +22,10 @@ const GUIDELINES: &[&str] = &[
 /// The default base: identity, tools, guidelines (the reference's shape,
 /// e's name).
 fn default_base() -> String {
-    let tools = TOOL_SNIPPETS
-        .iter()
+    // The tool list comes from the same table that registers the tools —
+    // the prompt can't advertise a tool that doesn't exist or miss one that
+    // does.
+    let tools = crate::core::tools::snippets()
         .map(|(name, snippet)| format!("- {name}: {snippet}"))
         .collect::<Vec<_>>()
         .join("\n");

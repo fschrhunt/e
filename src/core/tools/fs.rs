@@ -197,7 +197,10 @@ pub fn grep(args: &Value, cwd: &Path) -> ToolOutput {
     let mut hits = Vec::new();
     let mut count = 0usize;
     if root.is_dir() {
-        walk(&root, cwd, &re, &mut hits, &mut count);
+        super::walk_files(&root, &mut |path| {
+            search_file(path, cwd, &re, &mut hits, &mut count);
+            count < MATCH_CAP
+        });
     } else {
         // An explicitly requested file is searched as asked — the dotfile
         // skip rule is a traversal heuristic, not a veto over `.env`.
@@ -222,34 +225,6 @@ pub fn grep(args: &Value, cwd: &Path) -> ToolOutput {
 
 /// Matches after which a search stops rather than flooding the context.
 const MATCH_CAP: usize = 200;
-
-fn walk(dir: &Path, cwd: &Path, re: &regex::Regex, hits: &mut Vec<String>, count: &mut usize) {
-    const SKIP: &[&str] = &[".git", "target", "node_modules", "dist", ".cache"];
-    if *count >= MATCH_CAP {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e.flatten().map(|e| e.path()).collect::<Vec<_>>(),
-        Err(_) => return,
-    };
-    for path in entries {
-        if *count >= MATCH_CAP {
-            return;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if name.starts_with('.') || SKIP.contains(&name.as_str()) {
-            continue;
-        }
-        if path.is_dir() {
-            walk(&path, cwd, re, hits, count);
-        } else {
-            search_file(&path, cwd, re, hits, count);
-        }
-    }
-}
 
 fn search_file(
     path: &Path,
