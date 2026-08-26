@@ -139,7 +139,13 @@ fn target_path(args: &Value) -> String {
     sanitize_inline(args["path"].as_str().unwrap_or(""))
 }
 fn target_command(args: &Value) -> String {
-    sanitize_inline(args["command"].as_str().unwrap_or(""))
+    // A background check/kill call carries no `command` — fall back to the
+    // handle so the transcript still shows what the call is about.
+    let value = args["command"]
+        .as_str()
+        .or_else(|| args["handle"].as_str())
+        .unwrap_or("");
+    sanitize_inline(value)
 }
 fn target_pattern(args: &Value) -> String {
     sanitize_inline(args["pattern"].as_str().unwrap_or(""))
@@ -205,7 +211,7 @@ static SPECS: &[Spec] = &[
     },
     Spec {
         name: "bash",
-        snippet: "Execute a bash command in the workspace root. Each call is a fresh shell — cd and variables don't persist. Use it for anything without a dedicated tool: listing directories, finding files by name, git, builds, tests.",
+        snippet: "Execute a bash command in the workspace root. Each call is a fresh shell — cd and variables don't persist. Use it for anything without a dedicated tool: listing directories, finding files by name, git, builds, tests. Pass background: true to start something long-lived (a server, a watcher) without blocking; check or kill it later with handle.",
         category: "command",
         running: "Running",
         completed: "Ran",

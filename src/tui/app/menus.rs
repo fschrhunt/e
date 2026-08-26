@@ -23,6 +23,11 @@ impl App {
                 "/reload",
             ),
             MenuItem::new("/resume", "resume a saved session", "/resume"),
+            MenuItem::new(
+                "/tree",
+                "rewind to an earlier point in this session and branch",
+                "/tree",
+            ),
             MenuItem::new("/new", "start a fresh session", "/new"),
             MenuItem::new("/copy", "copy the last reply", "/copy"),
             MenuItem::new("/compact", "summarize into a fresh session", "/compact"),
@@ -313,6 +318,9 @@ impl App {
                     self.agent.model = found;
                     self.refresh_status_cache();
                 }
+            }
+            MenuKind::Tree => {
+                self.rewind_to_node(&item.value);
             }
         }
         true

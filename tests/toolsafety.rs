@@ -175,6 +175,27 @@ fn grep_searches_an_explicitly_requested_dotfile() {
     let _ = std::fs::remove_dir_all(&ws);
 }
 
+#[test]
+fn grep_glob_restricts_the_search_to_matching_files() {
+    let ws = workspace("grep-glob");
+    std::fs::write(ws.join("main.rs"), "needle in rust\n").unwrap();
+    std::fs::write(ws.join("notes.txt"), "needle in text\n").unwrap();
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src").join("lib.rs"), "needle in lib\n").unwrap();
+
+    let by_name = tools::run("grep", r#"{"pattern":"needle","glob":"*.rs"}"#, &ws);
+    assert_eq!(by_name.summary, "2 matches", "{}", by_name.content);
+    assert!(by_name.content.contains("main.rs"));
+    assert!(by_name.content.contains("lib.rs"));
+    assert!(!by_name.content.contains("notes.txt"));
+
+    let by_path = tools::run("grep", r#"{"pattern":"needle","glob":"src/**/*.rs"}"#, &ws);
+    assert_eq!(by_path.summary, "1 matches", "{}", by_path.content);
+    assert!(by_path.content.contains("lib.rs"));
+    assert!(!by_path.content.contains("main.rs"));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
 /// When the matched-line list alone is big enough to hit the 32KB output
 /// cap, the "stopped at N matches" explanation must still survive — not get
 /// overwritten by the generic byte-truncation marker.
