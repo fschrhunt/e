@@ -237,15 +237,18 @@ pub fn write(args: &Value, cwd: &Path) -> ToolOutput {
 
 fn count_text_lines(path: &Path) -> io::Result<usize> {
     // Counting lines for the write summary must not enforce the viewer's
-    // per-line cap or UTF-8 validity: a valid file with long lines (minified
-    // JS/JSON) or non-UTF-8 bytes is still overwritable, and bounding the
-    // read here would wrongly reject those writes. Stream for newlines only.
+    // per-line cap: a valid file with long lines (minified JS/JSON) is still
+    // overwritable, and bounding the read here would wrongly reject those
+    // writes. We still refuse non-UTF-8 files (they are binary, not text to
+    // overwrite) — validated incrementally so a long line is never held in
+    // memory, matching bounded_line's contract without its length limit.
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut buffer = [0u8; 64 * 1024];
     let mut newlines = 0usize;
     let mut ends_with_newline = true;
     let mut saw_any = false;
+    let mut pending = 0u8; // continuation bytes still expected for a lead
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
@@ -259,7 +262,34 @@ fn count_text_lines(path: &Path) -> io::Result<usize> {
             } else {
                 ends_with_newline = false;
             }
+            if pending > 0 {
+                if byte & 0xC0 != 0x80 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "file is not valid UTF-8",
+                    ));
+                }
+                pending -= 1;
+            } else if byte >= 0x80 {
+                pending = match byte {
+                    0xC2..=0xDF => 1,
+                    0xE0..=0xEF => 2,
+                    0xF0..=0xF4 => 3,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "file is not valid UTF-8",
+                        ))
+                    }
+                };
+            }
         }
+    }
+    if pending > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file is not valid UTF-8",
+        ));
     }
     // A trailing segment without a newline still counts as one line, matching
     // bounded_line's "last partial line counts" semantics.
