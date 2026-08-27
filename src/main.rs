@@ -28,11 +28,20 @@ async fn main() -> std::io::Result<()> {
         println!("e {}", e::VERSION);
         return Ok(());
     }
-    // Extensions start before normal argument parsing so the startup hook can
+    // Diagnostics are deliberately extension-free: launching a user-owned
+    // executable would violate `doctor`'s local/no-network contract before
+    // the report could even begin. Other commands still start extensions
+    // before normal argument parsing so the startup hook can
     // consume custom flags and safely relaunch this same binary in a new cwd,
     // and so --help can list the flags and commands extensions declare.
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<String>(256);
-    let host = if cli::extensions_disabled(&args) {
+    let diagnostic_requested = cli::parse(args.clone()).ok().is_some_and(|options| {
+        matches!(
+            options.positional.first().map(String::as_str),
+            Some("doctor" | "providers")
+        )
+    });
+    let host = if cli::extensions_disabled(&args) || diagnostic_requested {
         e::core::api::ExtensionHost::empty()
     } else {
         e::core::api::ExtensionHost::start(jobs_tx.clone()).await
