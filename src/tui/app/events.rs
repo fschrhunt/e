@@ -88,11 +88,12 @@ impl App {
                 }
             }
             SessionEvent::ToolCallAssembly { bytes } => {
-                // The model is streaming tool-call arguments — no text to
-                // show yet, but the row must move: phase plus a ticking
-                // estimate, so a long write call never looks like a stall.
+                // The model is streaming tool-call arguments. No phase of
+                // its own — the footer stays on Thinking (the model is
+                // still generating), the bytes count toward the token
+                // estimate, and the tool row appears in the tree when the
+                // call actually starts.
                 if let Some(s) = &mut self.active {
-                    s.turn.phase = TurnPhase::ToolAssembly;
                     s.turn.note_assembly(bytes);
                 }
             }

@@ -15,10 +15,6 @@ pub enum TurnPhase {
     Thinking,
     /// Backing off after a retryable failure before another attempt.
     Retrying,
-    /// The model is streaming tool-call arguments — real output the
-    /// transcript can't show yet. Without its own phase the row froze on
-    /// "Thinking" while a large write call assembled for tens of seconds.
-    ToolAssembly,
     Tool,
     AssistantText,
 }
@@ -79,8 +75,8 @@ pub struct Turn {
     /// chars/4 estimate of the current step's streamed text + reasoning.
     pub estimated_output: u64,
     streamed_chars: u64,
-    /// Cumulative tool-call argument bytes streamed this step (liveness for
-    /// the assembly phase; also real output the estimate must count).
+    /// Cumulative tool-call argument bytes streamed this step (real output
+    /// the token estimate must count).
     assembly_bytes: u64,
     pub phase: TurnPhase,
     /// Set while `phase == Retrying`.
@@ -199,18 +195,6 @@ impl Turn {
                     )
                 })
             }
-            TurnPhase::ToolAssembly => {
-                let tokens = self.tokens();
-                let suffix = if tokens.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {tokens}")
-                };
-                Some(format!(
-                    "Writing tool call ({}){suffix}",
-                    format_elapsed(elapsed_secs)
-                ))
-            }
             TurnPhase::Tool => None,
             TurnPhase::AssistantText => {
                 let tokens = self.tokens();
@@ -327,21 +311,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_assembly_keeps_the_row_alive() {
+    fn assembly_bytes_count_toward_the_estimate_while_thinking() {
         let mut turn = Turn::new();
         turn.note_usage(50_000, 200);
-        turn.phase = TurnPhase::ToolAssembly;
         turn.note_assembly(8_000); // ~2k tokens of argument JSON so far
         assert_eq!(
             turn.label(7).as_deref(),
-            Some("Writing tool call (7s) (↑50k ↓2.2k)")
+            Some("Thinking (7s) (↑50k ↓2.2k)"),
+            "argument streaming stays in the Thinking phase — the tool row, not the footer, owns the activity"
         );
         // The next cumulative report ticks the same counter.
         turn.note_assembly(12_000);
-        assert_eq!(
-            turn.label(8).as_deref(),
-            Some("Writing tool call (8s) (↑50k ↓3.2k)")
-        );
+        assert_eq!(turn.tokens(), "(↑50k ↓3.2k)");
     }
 
     #[test]
