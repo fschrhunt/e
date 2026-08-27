@@ -156,6 +156,7 @@ docs/extensions/
   scaffold.mjs   the wire-protocol helper (copy next to your extension)
   hello.mjs      every surface at once, on the scaffold
   gate.mjs       the tool_call hook as a fail-open guard
+  protected.mjs  the tool_call hook denying credential-shaped paths
   worktree.mjs   a minimal startup-hook launcher (e -w)
   subagent.mjs   bounded delegated e turns as a tool
   mcp.mjs        one MCP stdio server's tools as extension tools
@@ -174,6 +175,14 @@ own directory) it runs as a named no-op extension and stays silent.
 - **`gate.mjs`** — the `tool_call` hook as a guard, in e's fail-open
   shape: only an explicit block stops a call; a slow or crashed
   extension never blocks the agent.
+- **`protected.mjs`** — the `tool_call` hook denying any call (`read`,
+  `write`, `edit`, `grep`, `bash`) that touches a credential-shaped path —
+  `~/.ssh`, `~/.aws`, `~/.gnupg`, `.env*`, `*.pem`, `*.key` — whether that's
+  the tool's `path` argument or a bash command mentioning one. Unlike
+  `gate.mjs`'s destructive-command denylist, this one is about what gets
+  read into context or written to disk, not just what bash runs. See
+  [`docs/sandboxing.md`](sandboxing.md) for e's trust model and where a
+  hook like this fits.
 - **`worktree.mjs`** — the startup-hook launcher on the scaffold:
   `e -w [branch]` creates a Git worktree and relaunches e there.
 - **`subagent.mjs`** — a `delegate` tool that runs an isolated `e ask
