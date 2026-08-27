@@ -288,12 +288,17 @@ pub async fn run(
                         if call.arguments.is_empty() {
                             call.arguments = "{}".into();
                         }
-                        let _ = tx
-                            .send(Event::ToolCallEnd {
-                                key: index.to_string(),
-                            })
-                            .await;
-                        let _ = tx.send(Event::ToolCall(call)).await;
+                        // Same guard the other three dialects apply before
+                        // emitting a call: a nameless block is not a real
+                        // tool call to run.
+                        if !call.name.is_empty() {
+                            let _ = tx
+                                .send(Event::ToolCallEnd {
+                                    key: index.to_string(),
+                                })
+                                .await;
+                            let _ = tx.send(Event::ToolCall(call)).await;
+                        }
                     }
                     if let Some((thinking, signature)) = open_thinking.take() {
                         // Only a signed block is replayable; an unsigned one
