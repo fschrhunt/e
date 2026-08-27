@@ -549,12 +549,8 @@ impl Agent {
         };
         let system = match tool_mode {
             ToolMode::All => system,
-            ToolMode::ReadOnly => format!(
-                "{system}\n\nThis run is read-only. Only the read and grep tools are available."
-            ),
-            ToolMode::None => {
-                format!("{system}\n\nThis run has no tools. Answer without attempting tool calls.")
-            }
+            ToolMode::ReadOnly => format!("{system}\n\n{}", context::read_only_notice()),
+            ToolMode::None => format!("{system}\n\n{}", context::no_tools_notice()),
         };
 
         tokio::spawn(async move {

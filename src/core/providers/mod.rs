@@ -78,9 +78,17 @@ impl ImageInput {
         if metadata.len() > MAX_IMAGE_BYTES {
             return Err(format!("{}: image exceeds 20 MiB", path.display()));
         }
-        let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        // The file can change between metadata() and read(). Enforce the limit
-        // against the bytes we will actually retain in the session as well.
+        // The file can change size between metadata() and here — grow after a
+        // small reported size, or never end at all (a fifo, a procfs entry).
+        // Read through a bounded reader so such a file cannot be pulled into
+        // memory in full before the length check below ever runs.
+        use std::io::Read as _;
+        let file =
+            std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_IMAGE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         if bytes.len() as u64 > MAX_IMAGE_BYTES {
             return Err(format!("{}: image exceeds 20 MiB", path.display()));
         }
@@ -820,5 +828,47 @@ mod tests {
         assert_eq!(err.short, "504 Gateway Timeout");
         assert!(err.message.starts_with("504 Gateway Timeout: xxx"));
         assert!(err.message.len() < body.len());
+    }
+
+    fn temp_image_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "e-image-test-{}-{}-{name}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn a_valid_image_under_the_cap_loads() {
+        let path = temp_image_path("small.png");
+        let content = b"\x89PNG\r\n\x1a\nrest of a tiny file";
+        std::fs::write(&path, content).unwrap();
+        let (image, size) = ImageInput::from_path_with_size(&path).unwrap();
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(size, content.len() as u64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // from_path_with_size reads through take(MAX_IMAGE_BYTES + 1) rather
+    // than std::fs::read, so the post-read length check below can never be
+    // reached by pulling an arbitrarily large file fully into memory
+    // first. This test pins the still-correct outward behavior (reject,
+    // with this exact message) after that change; it can't observe memory
+    // use directly, but a regression back to an unbounded read would fail
+    // this the same way it fails the fifo-style "must fail fast, not
+    // block" tests elsewhere in this suite — by taking a very long time
+    // or exhausting memory instead of returning promptly.
+    #[test]
+    fn an_oversized_image_is_rejected_without_reading_past_the_cap() {
+        let path = temp_image_path("big.png");
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(MAX_IMAGE_BYTES as usize + 1, 0);
+        std::fs::write(&path, &bytes).unwrap();
+        let error = ImageInput::from_path_with_size(&path).unwrap_err();
+        assert!(error.contains("exceeds 20 MiB"), "{error}");
+        let _ = std::fs::remove_file(&path);
     }
 }

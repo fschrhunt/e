@@ -52,6 +52,14 @@ pub(super) fn remote_overlay(models: &mut Vec<Model>) {
         else {
             continue; // only providers e knows how to speak to
         };
+        if catalog_strategy == crate::core::providers::registry::CatalogStrategy::None {
+            // The provider's live discovery is off. A cache entry can
+            // outlive that setting (written before it changed, or left
+            // over from a prior config) — never resurrect it into the
+            // catalog, or `catalog: "none"` would not actually disable
+            // discovered models.
+            continue;
+        }
         let listed = entry.get("models").and_then(|v| v.as_array()).cloned();
         let legacy = entry.get("ids").and_then(|v| v.as_array()).map(|ids| {
             ids.iter()
@@ -327,5 +335,86 @@ async fn fetch_models(
         None
     } else {
         Some(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::providers::catalog::{Api, Model};
+    use crate::core::providers::registry::{CatalogStrategy, ResponsesMount};
+
+    // E_HOME is process-global; serialize tests that set it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn seeded_model(provider: &str, catalog: CatalogStrategy) -> Model {
+        Model {
+            provider: provider.into(),
+            id: "seed".into(),
+            base_url: "https://example.invalid".into(),
+            api: Api::Completions,
+            catalog,
+            responses_mount: ResponsesMount::Platform,
+            provider_supports_tools: true,
+            provider_image_input: false,
+            efforts: Vec::new(),
+            thinking: Thinking::Manual,
+            context_window: 200_000,
+            max_output: None,
+            supports_tools: true,
+            image_input: false,
+            pricing: None,
+        }
+    }
+
+    fn with_temp_home(name: &str, body: impl FnOnce(&std::path::Path)) {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "e-remote-overlay-{name}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("E_HOME", &dir);
+        body(&dir);
+        std::env::remove_var("E_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn catalog_none_ignores_a_cached_model_the_overlay_would_otherwise_merge() {
+        with_temp_home("none", |dir| {
+            std::fs::write(
+                dir.join("models-store.json"),
+                r#"{"acme":{"models":[{"id":"stale-model","context_window":128000}]}}"#,
+            )
+            .unwrap();
+
+            let mut models = vec![seeded_model("acme", CatalogStrategy::None)];
+            remote_overlay(&mut models);
+            assert_eq!(
+                models.len(),
+                1,
+                "catalog: none must not resurrect a cached model"
+            );
+        });
+    }
+
+    #[test]
+    fn a_normal_catalog_strategy_still_merges_cached_models() {
+        with_temp_home("openai", |dir| {
+            std::fs::write(
+                dir.join("models-store.json"),
+                r#"{"acme":{"models":[{"id":"discovered-model","context_window":128000}]}}"#,
+            )
+            .unwrap();
+
+            let mut models = vec![seeded_model("acme", CatalogStrategy::Openai)];
+            remote_overlay(&mut models);
+            assert!(
+                models.iter().any(|m| m.id == "discovered-model"),
+                "a provider without catalog: none should still pick up cached models"
+            );
+        });
     }
 }

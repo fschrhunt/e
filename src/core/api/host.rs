@@ -705,7 +705,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             loop {
-                match read_bounded_line(&mut reader).await {
+                match read_bounded_line(&mut reader, MAX_EXTENSION_LINE_BYTES).await {
                     Ok(Some(line)) if !line.trim().is_empty() => {
                         let _ = notices.try_send(format!("extension {source}: {line}"));
                     }
@@ -759,7 +759,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
     let alive_reader = alive.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
-        while let Ok(Some(line)) = read_bounded_line(&mut reader).await {
+        while let Ok(Some(line)) = read_bounded_line(&mut reader, MAX_EXTENSION_LINE_BYTES).await {
             match protocol::parse_incoming(&line) {
                 Some(Incoming::Response { id, result }) => {
                     if let Some(tx) = pending_reader.lock().unwrap().remove(&id) {
@@ -823,9 +823,22 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
     Ok(Extension { manifest, ..ext })
 }
 
-/// Read one protocol line without allowing a misbehaving extension to grow
-/// memory indefinitely. The newline is consumed but not returned.
-async fn read_bounded_line<R>(reader: &mut R) -> std::io::Result<Option<String>>
+/// Read one line without allowing an unbounded peer to grow memory
+/// indefinitely — a misbehaving extension on the other flavor of this call,
+/// or (via the `pub` re-export) an RPC client sending an unterminated or
+/// giant line. The newline is consumed but not returned.
+///
+/// Errors the instant the cap is crossed, before a newline is even in
+/// view — deliberately, not just as a memory bound: a still-growing line
+/// with no newline yet (a firehose, or a client that never terminates one)
+/// must be cut off promptly rather than read forever looking for a
+/// newline that may never come. Every caller therefore treats this error
+/// as fatal to its read loop, never as "skip this line and keep going" —
+/// the stream is left mid-line, not resynced to the next one.
+pub async fn read_bounded_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<String>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -840,11 +853,11 @@ where
         }
 
         if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-            if line.len().saturating_add(newline) > MAX_EXTENSION_LINE_BYTES {
+            if line.len().saturating_add(newline) > max_bytes {
                 reader.consume(newline + 1);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "protocol line exceeded 1 MiB",
+                    format!("line exceeded {max_bytes} bytes"),
                 ));
             }
             line.extend_from_slice(&available[..newline]);
@@ -853,11 +866,11 @@ where
         }
 
         let count = available.len();
-        if line.len().saturating_add(count) > MAX_EXTENSION_LINE_BYTES {
+        if line.len().saturating_add(count) > max_bytes {
             reader.consume(count);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "protocol line exceeded 1 MiB",
+                format!("line exceeded {max_bytes} bytes"),
             ));
         }
         line.extend_from_slice(available);

@@ -115,6 +115,11 @@ e -v, --version"
 
     match auth_status_requested(args) {
         Ok(true) => {
+            if options.json {
+                eprintln!("--json is supported by `e ask`, `e doctor`, and `e providers`");
+                host.shutdown().await;
+                std::process::exit(2);
+            }
             e::core::auth::login::auth_status();
             host.shutdown().await;
             return Ok(());
@@ -453,6 +458,14 @@ impl TurnAccumulator {
     }
 }
 
+/// Bound on one RPC request line — generous for pasted prompt text (images
+/// travel as file paths, not inline bytes) but never unbounded: an
+/// unterminated or malicious client must not grow this long-lived
+/// process's memory without limit. Matches read_bounded_line's fail-fast
+/// contract: hitting it ends the loop rather than skipping the line, since
+/// a still-growing line with no newline yet cannot be safely resynced past.
+const MAX_RPC_LINE_BYTES: usize = 10 * 1024 * 1024;
+
 /// A deliberately small machine protocol: sequential JSONL requests in,
 /// exactly one JSON object out for each line. The extension host is reused,
 /// while each request gets an isolated Agent and is memory-only by default.
@@ -460,9 +473,25 @@ async fn rpc(
     host: std::sync::Arc<e::core::api::ExtensionHost>,
     defaults: &Options,
 ) -> std::io::Result<()> {
-    use tokio::io::AsyncBufReadExt as _;
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    loop {
+        let line = match e::core::api::read_bounded_line(&mut reader, MAX_RPC_LINE_BYTES).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(error) => {
+                // Fatal, same as a too-large extension line is fatal to its
+                // reader: an oversized or unterminated line leaves the
+                // stream mid-line with no safe resync point, so one error
+                // response goes out and the process stops serving rather
+                // than risk parsing the remainder of a giant line as if it
+                // were fresh requests.
+                println!(
+                    "{}",
+                    serde_json::json!({"id": null, "error": format!("invalid request: {error}")})
+                );
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
