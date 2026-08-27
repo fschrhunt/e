@@ -59,7 +59,7 @@ connect({
     if (modeFlag) args.push(modeFlag);
     if (input.model) args.push("--model", input.model);
     if (input.effort) args.push("--effort", input.effort);
-    args.push("ask", input.prompt);
+    args.push("ask", "--", input.prompt);
     update(`delegating (${mode})\n`);
 
     const child = spawn(process.env.E_BIN || "e", args, {

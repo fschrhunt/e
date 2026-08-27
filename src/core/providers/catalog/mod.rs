@@ -151,7 +151,7 @@ pub fn builtin_catalog() -> Vec<Model> {
                 thinking: Thinking::from_decl(decl.thinking.as_deref()),
                 context_window: decl.context_window,
                 max_output: decl.max_output,
-                supports_tools: decl.supports_tools,
+                supports_tools: decl.supports_tools && provider.supports_tools,
                 image_input: decl.image_input || provider.image_input,
                 pricing: decl.pricing.clone(),
             })
