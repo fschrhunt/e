@@ -89,6 +89,11 @@ fn bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
         let take = end.map(|index| index + 1).unwrap_or(available.len());
         if bytes.len().saturating_add(take) > MAX_LINE_BYTES {
             reader.consume(take);
+            // Leave the reader at the start of the next physical line so a
+            // caller that keeps scanning (grep) can move past an oversized
+            // one instead of aborting the whole file. Bounded: we never hold
+            // more than the current buffer chunk.
+            drain_line_remainder(reader);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("line exceeds {MAX_LINE_BYTES} bytes"),
@@ -111,6 +116,31 @@ fn bounded_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))
 }
 
+/// Discard the rest of the current physical line (through the next `\n`, or
+/// EOF) without allocating it, so a caller can resume scanning later lines
+/// after an oversized one. Reads in fixed chunks; never retains more than one.
+fn drain_line_remainder<R: BufRead>(reader: &mut R) {
+    loop {
+        // Capture plain counts so the `fill_buf` borrow ends before `consume`.
+        let (consume, found_newline) = match reader.fill_buf() {
+            Ok(a) => {
+                if a.is_empty() {
+                    return;
+                }
+                match a.iter().position(|b| *b == b'\n') {
+                    Some(pos) => (pos + 1, true),
+                    None => (a.len(), false),
+                }
+            }
+            Err(_) => return,
+        };
+        reader.consume(consume);
+        if found_newline {
+            return;
+        }
+    }
+}
+
 fn read_window(path: &Path, offset: Option<u64>, limit: Option<u64>) -> io::Result<String> {
     let file = std::fs::File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -119,13 +149,19 @@ fn read_window(path: &Path, offset: Option<u64>, limit: Option<u64>) -> io::Resu
     let mut output = String::new();
     let mut line_number = 0usize;
     let mut returned = 0usize;
-    while let Some(line) = bounded_line(&mut reader)? {
+    loop {
+        // Stop before reading the next line once the window is full: a line
+        // past `limit` (or the 32 KiB output cap) may be oversized or invalid
+        // UTF-8, and reading it would turn a valid window into an error.
+        if returned >= limit || output.len() > 32 * 1024 {
+            break;
+        }
+        let Some(line) = bounded_line(&mut reader)? else {
+            break;
+        };
         line_number += 1;
         if line_number < first {
             continue;
-        }
-        if returned >= limit || output.len() > 32 * 1024 {
-            break;
         }
         if !output.is_empty() {
             output.push('\n');
@@ -200,13 +236,38 @@ pub fn write(args: &Value, cwd: &Path) -> ToolOutput {
 }
 
 fn count_text_lines(path: &Path) -> io::Result<usize> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut lines = 0usize;
-    while bounded_line(&mut reader)?.is_some() {
-        lines += 1;
+    // Counting lines for the write summary must not enforce the viewer's
+    // per-line cap or UTF-8 validity: a valid file with long lines (minified
+    // JS/JSON) or non-UTF-8 bytes is still overwritable, and bounding the
+    // read here would wrongly reject those writes. Stream for newlines only.
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut newlines = 0usize;
+    let mut ends_with_newline = true;
+    let mut saw_any = false;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        saw_any = true;
+        for &byte in &buffer[..n] {
+            if byte == b'\n' {
+                newlines += 1;
+                ends_with_newline = true;
+            } else {
+                ends_with_newline = false;
+            }
+        }
     }
-    Ok(lines)
+    // A trailing segment without a newline still counts as one line, matching
+    // bounded_line's "last partial line counts" semantics.
+    Ok(if saw_any && !ends_with_newline {
+        newlines + 1
+    } else {
+        newlines
+    })
 }
 
 pub fn grep_schema() -> Value {
@@ -345,15 +406,23 @@ fn search_file(
     let rel = path.strip_prefix(cwd).unwrap_or(path).display().to_string();
     let mut reader = BufReader::new(file);
     let mut n = 0usize;
-    while let Ok(Some(line)) = bounded_line(&mut reader) {
-        n += 1;
-        if re.is_match(&line) {
-            let line = truncate_match_line(line.trim());
-            hits.push(format!("{rel}:{n}: {line}"));
-            *count += 1;
-            if *count >= MATCH_CAP {
-                return;
+    loop {
+        match bounded_line(&mut reader) {
+            Ok(Some(line)) => {
+                n += 1;
+                if re.is_match(&line) {
+                    let line = truncate_match_line(line.trim());
+                    hits.push(format!("{rel}:{n}: {line}"));
+                    *count += 1;
+                    if *count >= MATCH_CAP {
+                        return;
+                    }
+                }
             }
+            Ok(None) => break,
+            // Oversized or non-UTF-8 line: skip it (bounded_line advanced past
+            // it) and keep scanning later lines instead of dropping them.
+            Err(_) => n += 1,
         }
     }
 }

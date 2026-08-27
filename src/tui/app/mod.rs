@@ -1992,7 +1992,7 @@ pub async fn run(
                         // Ignore a result that outlived its session (/new won).
                         if app.compaction_is_current(epoch) {
                             app.compacting = false;
-                            if app.agent.load_compacted(&summary, kept) {
+                            if app.agent.load_compacted(&summary, kept).await {
                                 app.context_tokens =
                                     crate::core::agent::compact::estimate_request_tokens(
                                         &system_prompt(),

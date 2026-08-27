@@ -21,6 +21,29 @@ fn auth_status_requested(args: &[String]) -> Result<bool, &'static str> {
     }
 }
 
+/// The subcommand after stripping any leading extension typed flags
+/// (`--flag value`), which `cli::parse` leaves in `positional`. This lets
+/// diagnostics stay extension-free even when a typed flag precedes the
+/// command (e.g. `e --worktree feature doctor`): the flag is not the
+/// subcommand, and `doctor`/`providers` must run without launching
+/// extensions.
+fn effective_subcommand(positional: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < positional.len() {
+        let token = &positional[i];
+        if token.starts_with("--") {
+            i += 1;
+            // A typed flag's value is the next token unless it is itself a flag.
+            if i < positional.len() && !positional[i].starts_with("--") {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(token.as_str());
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,7 +60,7 @@ async fn main() -> std::io::Result<()> {
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<String>(256);
     let diagnostic_requested = cli::parse(args.clone()).ok().is_some_and(|options| {
         matches!(
-            options.positional.first().map(String::as_str),
+            effective_subcommand(&options.positional),
             Some("doctor" | "providers")
         )
     });
@@ -95,16 +118,23 @@ e -v, --version"
     // their startup hooks do not get to intercept or relaunch these commands.
     if let Ok(diagnostic_options) = cli::parse(args.clone()) {
         let diagnostic_args = &diagnostic_options.positional;
-        if matches!(
-            diagnostic_args.first().map(String::as_str),
-            Some("doctor" | "providers")
-        ) {
-            let doctor = diagnostic_args.first().map(String::as_str) == Some("doctor");
+        let sub = effective_subcommand(diagnostic_args);
+        if sub == Some("doctor") || sub == Some("providers") {
+            let doctor = sub == Some("doctor");
+            // Everything before the subcommand is extension typed flags; after
+            // it, only `--no-network` is accepted for doctor.
+            let sub_idx = diagnostic_args
+                .iter()
+                .position(|a| a == "doctor" || a == "providers")
+                .unwrap();
+            let after: Vec<&str> = diagnostic_args[sub_idx + 1..]
+                .iter()
+                .map(String::as_str)
+                .collect();
             let valid = if doctor {
-                diagnostic_args.as_slice() == ["doctor"]
-                    || diagnostic_args.as_slice() == ["doctor", "--no-network"]
+                after.is_empty() || after == ["--no-network"]
             } else {
-                diagnostic_args.as_slice() == ["providers"]
+                after.is_empty()
             };
             if !valid {
                 eprintln!(
