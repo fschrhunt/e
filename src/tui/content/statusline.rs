@@ -55,6 +55,18 @@ fn clip(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Elapsed time in the activity row: seconds under a minute, minutes and
+/// seconds above, hours and minutes beyond — never a bare `636s`.
+pub fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Per-turn token flow and focused activity phase.
 pub struct Turn {
     /// Latest request's full context, from real usage (a chars/4 seed until
@@ -162,7 +174,10 @@ impl Turn {
                 } else {
                     format!(" {tokens}")
                 };
-                Some(format!("Thinking ({elapsed_secs}s){suffix}"))
+                Some(format!(
+                    "Thinking ({}){suffix}",
+                    format_elapsed(elapsed_secs)
+                ))
             }
             TurnPhase::Retrying => {
                 let r = self.retry.as_ref()?;
@@ -191,7 +206,10 @@ impl Turn {
                 } else {
                     format!(" {tokens}")
                 };
-                Some(format!("Writing tool call ({elapsed_secs}s){suffix}"))
+                Some(format!(
+                    "Writing tool call ({}){suffix}",
+                    format_elapsed(elapsed_secs)
+                ))
             }
             TurnPhase::Tool => None,
             TurnPhase::AssistantText => {
@@ -269,7 +287,7 @@ pub fn statusline(
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveredStatus, RetryStatus, Turn, TurnPhase};
+    use super::{format_elapsed, RecoveredStatus, RetryStatus, Turn, TurnPhase};
     use crate::core::providers::FailureCause;
 
     #[test]
@@ -287,6 +305,25 @@ mod tests {
 
         turn.phase = TurnPhase::Thinking;
         assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1k ↓20)"));
+    }
+
+    #[test]
+    fn elapsed_switches_to_minutes_above_a_minute() {
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m 00s");
+        assert_eq!(format_elapsed(636), "10m 36s");
+        assert_eq!(format_elapsed(3_725), "1h 02m");
+    }
+
+    #[test]
+    fn thinking_label_shows_minutes_past_a_minute() {
+        let mut turn = Turn::new();
+        turn.input = 39_000;
+        turn.output = 20_000;
+        assert_eq!(
+            turn.label(636).as_deref(),
+            Some("Thinking (10m 36s) (↑39k ↓20k)")
+        );
     }
 
     #[test]
