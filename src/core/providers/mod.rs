@@ -1,19 +1,119 @@
 //! The provider seam: one request contract, one normalized event stream.
 //!
 //! Everything above this module sees `Event`s; everything below is a wire
-//! dialect. Three dialects ship: chat-completions, Responses-API, and
-//! Anthropic Messages (see `api/`). Providers are data (`data/*.json`);
+//! dialect. Four dialects ship: chat-completions, Responses, Anthropic
+//! Messages, and Gemini (see `api/`). Providers are data (`data/*.json`);
 //! OAuth refresh lives in `auth::login`. SSE framing is handled here — one
 //! small splitter, tested, shared.
 
 pub mod api;
 pub mod catalog;
+pub mod diagnostics;
 pub mod registry;
+pub mod runtime;
 
 use serde::Serialize;
 use tokio::sync::mpsc;
 
 use crate::core::providers::catalog::{Api, Model};
+
+const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_IMAGE_COUNT: usize = 10;
+const MAX_TOTAL_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
+
+#[derive(Clone, Debug, serde::Deserialize, Serialize)]
+pub struct ImageInput {
+    pub media_type: String,
+    /// Base64 without a data-URL prefix. Sessions retain the bytes so resume
+    /// does not depend on the original file still existing or staying still.
+    pub data: std::sync::Arc<str>,
+}
+
+impl ImageInput {
+    pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
+        Self::from_path_with_size(path).map(|(image, _)| image)
+    }
+
+    /// Load a bounded first-turn attachment batch. Keeping count, aggregate,
+    /// file-type, and race-safe byte checks here gives the TUI, ask, and RPC
+    /// paths one definition of a valid image batch.
+    pub fn from_paths(paths: &[String]) -> Result<Vec<Self>, String> {
+        if paths.len() > MAX_IMAGE_COUNT {
+            return Err(format!(
+                "at most {MAX_IMAGE_COUNT} --image attachments are allowed"
+            ));
+        }
+        let declared_total = paths.iter().try_fold(0u64, |total, path| {
+            let metadata = std::fs::metadata(path).map_err(|error| format!("{path}: {error}"))?;
+            total
+                .checked_add(metadata.len())
+                .ok_or_else(|| "image attachment sizes overflowed".to_string())
+        })?;
+        if declared_total > MAX_TOTAL_IMAGE_BYTES {
+            return Err("image attachments exceed 40 MiB in total".into());
+        }
+
+        let mut actual_total = 0u64;
+        let mut images = Vec::with_capacity(paths.len());
+        for path in paths {
+            let (image, size) = Self::from_path_with_size(std::path::Path::new(path))?;
+            actual_total = actual_total
+                .checked_add(size)
+                .ok_or_else(|| "image attachment sizes overflowed".to_string())?;
+            if actual_total > MAX_TOTAL_IMAGE_BYTES {
+                return Err("image attachments exceed 40 MiB in total".into());
+            }
+            images.push(image);
+        }
+        Ok(images)
+    }
+
+    fn from_path_with_size(path: &std::path::Path) -> Result<(Self, u64), String> {
+        use base64::Engine as _;
+        let metadata =
+            std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{}: not a regular file", path.display()));
+        }
+        if metadata.len() > MAX_IMAGE_BYTES {
+            return Err(format!("{}: image exceeds 20 MiB", path.display()));
+        }
+        let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        // The file can change between metadata() and read(). Enforce the limit
+        // against the bytes we will actually retain in the session as well.
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(format!("{}: image exceeds 20 MiB", path.display()));
+        }
+        let media_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            "image/jpeg"
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            "image/gif"
+        } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            "image/webp"
+        } else {
+            return Err(format!(
+                "{}: unsupported image data (use png, jpg, gif, or webp)",
+                path.display()
+            ));
+        };
+        let size = bytes.len() as u64;
+        Ok((
+            ImageInput {
+                media_type: media_type.into(),
+                data: base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .into(),
+            },
+            size,
+        ))
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+}
 
 /// One requested tool invocation, as the model asked for it.
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
@@ -47,6 +147,8 @@ pub struct ChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_meta: Option<ToolResultMeta>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
 }
 
 impl ChatMessage {
@@ -57,6 +159,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_meta: None,
+            images: Vec::new(),
         }
     }
     pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
@@ -66,6 +169,7 @@ impl ChatMessage {
             tool_calls,
             tool_call_id: None,
             tool_meta: None,
+            images: Vec::new(),
         }
     }
     /// A dialect-owned reasoning item (signed thinking block, Responses
@@ -77,6 +181,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             tool_meta: None,
+            images: Vec::new(),
         }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -86,6 +191,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             tool_meta: None,
+            images: Vec::new(),
         }
     }
 
@@ -104,7 +210,14 @@ impl ChatMessage {
                 outcome,
                 summary: summary.into(),
             }),
+            images: Vec::new(),
         }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageInput>) -> Self {
+        let mut message = Self::user(content);
+        message.images = images;
+        message
     }
 }
 
@@ -307,11 +420,23 @@ pub enum Event {
     TextDelta(String),
     ReasoningDelta(String),
     /// Bytes of tool-call argument JSON just streamed. Argument assembly is
-    /// the one long phase with no visible text — a model writing a 20KB
-    /// `write` call streams for tens of seconds — so without this the UI
-    /// (and its live token estimate) sits frozen while the turn is alive.
-    ToolCallDelta {
-        bytes: u64,
+    /// A provider began streaming one tool request. `key` is stable within
+    /// this response even when the provider has not supplied the call id yet
+    /// (for example, a chat-completions tool index).
+    ToolCallStart {
+        key: String,
+    },
+    /// One exact argument fragment for a particular in-flight call. Keeping
+    /// identity and content here makes interleaved calls testable and lets
+    /// frontends show useful progress without parsing provider wire frames.
+    ToolArgumentsDelta {
+        key: String,
+        delta: String,
+    },
+    /// Argument streaming for this key is complete. Execution still begins
+    /// only after the following validated `ToolCall` event.
+    ToolCallEnd {
+        key: String,
     },
     /// A completed tool request (dialects accumulate the argument deltas).
     ToolCall(ToolCall),
@@ -349,11 +474,14 @@ pub struct Request {
 pub fn stream(request: Request) -> (mpsc::Receiver<Event>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(64);
     let handle = tokio::spawn(async move {
-        let result = match request.model.api {
-            Api::Completions => api::completions::run(&request, &tx).await,
-            Api::Responses => api::responses::run(&request, &tx).await,
-            Api::Anthropic => api::anthropic::run(&request, &tx).await,
-            Api::Google => api::google::run(&request, &tx).await,
+        let result = match runtime::authorize(&request.model).await {
+            Ok(authorization) => match request.model.api {
+                Api::Completions => api::completions::run(&request, &authorization, &tx).await,
+                Api::Responses => api::responses::run(&request, &authorization, &tx).await,
+                Api::Anthropic => api::anthropic::run(&request, &authorization, &tx).await,
+                Api::Google => api::google::run(&request, &authorization, &tx).await,
+            },
+            Err(error) => Err(error),
         };
         match result {
             Ok(end) => {

@@ -32,12 +32,20 @@ const MAX_EXTENSION_LINE_BYTES: usize = 1024 * 1024;
 
 /// Requests awaiting a response, keyed by wire id.
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type ProgressMap = Arc<Mutex<HashMap<u64, mpsc::Sender<ToolProgress>>>>;
+
+#[derive(Clone, Debug)]
+pub struct ToolProgress {
+    pub stream: crate::core::tools::OutputStream,
+    pub chunk: String,
+}
 
 struct Extension {
     manifest: Manifest,
     /// Outgoing lines to the process's stdin.
     writer: mpsc::Sender<String>,
     pending: PendingMap,
+    progress: ProgressMap,
     /// False once either process pipe proves the extension has exited.
     /// Pending requests fail immediately and new ones are refused.
     alive: Arc<AtomicBool>,
@@ -127,6 +135,20 @@ impl ExtensionHost {
 
     pub fn is_empty(&self) -> bool {
         self.extensions.is_empty()
+    }
+
+    /// Extension identities for diagnostics. No config, arguments, or child
+    /// process details are exposed here.
+    pub fn identities(&self) -> Vec<(String, String)> {
+        self.extensions
+            .iter()
+            .map(|extension| {
+                (
+                    extension.manifest.name.clone(),
+                    extension.manifest.version.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Parse argv against every extension's typed flag declarations. Returns
@@ -373,6 +395,24 @@ impl ExtensionHost {
     }
 
     pub async fn call_tool(&self, name: &str, arguments: &str) -> ToolResult {
+        let (progress, updates) = mpsc::channel(1);
+        // This compatibility wrapper deliberately discards progress. Drop
+        // the receiver before dispatch so a chatty streaming extension sees
+        // a closed channel instead of filling an unpolled buffer and
+        // deadlocking before its final response.
+        drop(updates);
+        self.call_tool_streaming(name, arguments, progress).await
+    }
+
+    /// Run an extension tool while routing the additive `tool.update`
+    /// capability for this request into `progress`. Extensions that do not
+    /// implement it remain compatible: they simply send no updates.
+    pub async fn call_tool_streaming(
+        &self,
+        name: &str,
+        arguments: &str,
+        progress: mpsc::Sender<ToolProgress>,
+    ) -> ToolResult {
         let Some(ext) = self
             .extensions
             .iter()
@@ -387,11 +427,12 @@ impl ExtensionHost {
         let args: Value =
             serde_json::from_str(arguments).unwrap_or(Value::String(arguments.into()));
         match self
-            .request(
+            .request_with_progress(
                 ext,
                 "tool_call",
                 json!({"name": name, "arguments": args}),
                 TOOL_TIMEOUT,
+                Some(progress),
             )
             .await
         {
@@ -542,17 +583,33 @@ impl ExtensionHost {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, String> {
+        self.request_with_progress(ext, method, params, timeout, None)
+            .await
+    }
+
+    async fn request_with_progress(
+        &self,
+        ext: &Extension,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+        progress: Option<mpsc::Sender<ToolProgress>>,
+    ) -> Result<Value, String> {
         if !ext.alive.load(Ordering::SeqCst) {
             return Err("extension exited".into());
         }
         let id = self.ids.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         ext.pending.lock().unwrap().insert(id, tx);
+        if let Some(progress) = progress {
+            ext.progress.lock().unwrap().insert(id, progress);
+        }
         // Whatever ends this call — response, timeout, or the caller
         // dropping the future on Esc — the pending entry goes with it: a
         // stale sender must not linger until the extension answers.
         let _guard = PendingGuard {
             pending: ext.pending.clone(),
+            progress: ext.progress.clone(),
             id,
         };
         // Close the race with the stdout reader ending between the first
@@ -585,12 +642,14 @@ impl ExtensionHost {
 /// the caller dropping the request future.
 struct PendingGuard {
     pending: PendingMap,
+    progress: ProgressMap,
     id: u64,
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         self.pending.lock().unwrap().remove(&self.id);
+        self.progress.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -662,11 +721,13 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
     }
 
     let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+    let progress: ProgressMap = Arc::new(Mutex::new(HashMap::new()));
     let alive = Arc::new(AtomicBool::new(true));
 
     // Writer task: serialized line output.
     let (writer, mut writer_rx) = mpsc::channel::<String>(64);
     let pending_writer = pending.clone();
+    let progress_writer = progress.clone();
     let alive_writer = alive.clone();
     tokio::spawn(async move {
         let mut stdin = stdin;
@@ -674,16 +735,19 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
             if stdin.write_all(line.as_bytes()).await.is_err() {
                 alive_writer.store(false, Ordering::SeqCst);
                 pending_writer.lock().unwrap().clear();
+                progress_writer.lock().unwrap().clear();
                 break;
             }
             if stdin.write_all(b"\n").await.is_err() {
                 alive_writer.store(false, Ordering::SeqCst);
                 pending_writer.lock().unwrap().clear();
+                progress_writer.lock().unwrap().clear();
                 break;
             }
             if stdin.flush().await.is_err() {
                 alive_writer.store(false, Ordering::SeqCst);
                 pending_writer.lock().unwrap().clear();
+                progress_writer.lock().unwrap().clear();
                 break;
             }
         }
@@ -691,6 +755,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
 
     // Reader task: route responses to pending waiters, notifies to the app.
     let pending_reader = pending.clone();
+    let progress_reader = progress.clone();
     let alive_reader = alive.clone();
     tokio::spawn(async move {
         let mut reader = BufReader::new(stdout);
@@ -706,6 +771,14 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
                     // channel must never hold up response dispatch.
                     let _ = notices.try_send(message);
                 }
+                Some(Incoming::ToolUpdate { id, stream, chunk }) => {
+                    let target = progress_reader.lock().unwrap().get(&id).cloned();
+                    if let Some(tx) = target {
+                        // Backpressure keeps progress ordered ahead of the
+                        // response line that follows it on extension stdout.
+                        let _ = tx.send(ToolProgress { stream, chunk }).await;
+                    }
+                }
                 None => {}
             }
         }
@@ -713,6 +786,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
         // Dropping the senders wakes every request through its
         // `Ok(Err(_)) => extension exited` path instead of its long timeout.
         pending_reader.lock().unwrap().clear();
+        progress_reader.lock().unwrap().clear();
     });
 
     // Handshake.
@@ -720,6 +794,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
         manifest: Manifest::default(),
         writer,
         pending,
+        progress,
         alive,
         child: Mutex::new(Some(child)),
     };
@@ -729,6 +804,7 @@ async fn spawn(path: &PathBuf, notices: mpsc::Sender<String>) -> Result<Extensio
     };
     let init = json!({
         "protocol": protocol::PROTOCOL_VERSION,
+        "capabilities": ["tool.update"],
         "e_version": crate::VERSION,
         "cwd": std::env::current_dir().unwrap_or_default().display().to_string(),
         // Namespaced extension config from ~/.e/settings.json:

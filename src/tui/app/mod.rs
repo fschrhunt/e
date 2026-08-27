@@ -13,7 +13,7 @@ use futures::StreamExt;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
-use crate::core::agent::{Agent, SessionEvent};
+use crate::core::agent::{Agent, AgentOptions, SessionEvent};
 use crate::core::output::{format_duration, format_tokens};
 use crate::core::providers::catalog::{self as model, Model};
 use crate::tui::authpanel::{self, AuthStage};
@@ -49,6 +49,9 @@ struct ActiveTurn {
     tool_blocks: std::collections::HashMap<u64, usize>,
     /// Batch members not yet terminal, including serially pending calls.
     pending_tools: usize,
+    /// Accumulated provider-billed estimate for this turn, when the model
+    /// declares rates. Unlike the context gauge, every request step counts.
+    cost_usd: Option<f64>,
 }
 
 /// The ctrl+o full-detail screen: one stored output at a time, scrollable,
@@ -213,6 +216,7 @@ struct App {
     /// A command-line prompt held until the first-visit trust choice is
     /// persisted, so its system prompt reflects that choice.
     pending_initial: Option<String>,
+    pending_initial_images: Vec<crate::core::providers::ImageInput>,
     /// Transcript index of the running `!` block, updated on completion.
     shell_block: Option<usize>,
     /// A /reload is restarting the extension host; prompts are held.
@@ -451,8 +455,15 @@ impl App {
         for m in messages {
             match m.role.as_str() {
                 "user" => {
-                    self.transcript
-                        .push(Block::new(Kind::User, m.content.clone()));
+                    let mut content = m.content.clone();
+                    if !m.images.is_empty() {
+                        content.push_str(&format!(
+                            "\n[attached {} image{}]",
+                            m.images.len(),
+                            if m.images.len() == 1 { "" } else { "s" }
+                        ));
+                    }
+                    self.transcript.push(Block::new(Kind::User, content));
                 }
                 "assistant" => {
                     if !m.content.trim().is_empty() {
@@ -561,7 +572,7 @@ impl App {
         // A -r launch prompt waits for this selection; deliver it against
         // the loaded history.
         if let Some(initial) = self.pending_initial.take() {
-            self.submit(initial);
+            self.submit_initial(initial);
         }
     }
 
@@ -858,8 +869,30 @@ impl App {
     fn release_initial_prompt(&mut self) {
         if self.trust.is_none() {
             if let Some(initial) = self.pending_initial.take() {
-                self.submit(initial);
+                self.submit_initial(initial);
             }
+        }
+    }
+
+    fn submit_initial(&mut self, text: String) {
+        if self.pending_initial_images.is_empty() {
+            self.submit(text);
+            return;
+        }
+        let images = std::mem::take(&mut self.pending_initial_images);
+        let count = images.len();
+        let held = self.agent.submit_message(
+            crate::core::providers::ChatMessage::user_with_images(text.clone(), images),
+            system_prompt(),
+        );
+        if !held {
+            self.transcript.push(Block::new(
+                Kind::User,
+                format!(
+                    "{text}\n[attached {count} image{}]",
+                    if count == 1 { "" } else { "s" }
+                ),
+            ));
         }
     }
 
@@ -1370,12 +1403,29 @@ fn key_of(event: &KeyEvent, keymap: &crate::core::config::keybindings::Keymap) -
 
 /// Open the interactive session. `args` are already past the extension
 /// startup hook (flags rewritten, cwd possibly changed).
+pub struct RunOptions {
+    pub initial: String,
+    pub continue_session: bool,
+    pub resume_session: bool,
+    pub model: Model,
+    pub agent: AgentOptions,
+    pub images: Vec<crate::core::providers::ImageInput>,
+}
+
 pub async fn run(
-    args: Vec<String>,
+    options: RunOptions,
     host: std::sync::Arc<crate::core::api::ExtensionHost>,
     jobs_tx: tokio::sync::mpsc::Sender<String>,
     mut jobs_rx: tokio::sync::mpsc::Receiver<String>,
 ) -> std::io::Result<()> {
+    let RunOptions {
+        initial,
+        continue_session,
+        resume_session,
+        model,
+        agent: agent_options,
+        images,
+    } = options;
     // A panic mid-frame must not strand the shell in raw mode with a hidden
     // cursor or kitty keyboard flags — restore the terminal first, then
     // report as usual. (\x1b[<u pops the keyboard enhancement stack.)
@@ -1414,7 +1464,7 @@ pub async fn run(
 
     let (mut cols, mut rows) = terminal::size()?;
     let mut painter = Painter::spawn(cols, rows);
-    let (mut agent, mut session_events) = Agent::new(model::default_model());
+    let (mut agent, mut session_events) = Agent::with_options(model, agent_options.clone());
     let (logins_tx, mut logins_rx) =
         tokio::sync::mpsc::channel::<crate::core::auth::login::Outcome>(4);
     let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<AppJob>(16);
@@ -1448,6 +1498,7 @@ pub async fn run(
         held_prompts: Vec::new(),
         trust: None,
         pending_initial: None,
+        pending_initial_images: images,
         shell_block: None,
         reloading: false,
         reload_block: None,
@@ -1465,6 +1516,18 @@ pub async fn run(
         .push(Block::new(Kind::Banner, crate::VERSION));
     for warning in model::config_warnings() {
         app.notice(format!("warning: {warning}"));
+    }
+    if !agent_options.save_session {
+        app.notice("session saving disabled for this run".into());
+    }
+    match agent_options.tool_mode {
+        crate::core::cli::ToolMode::ReadOnly => {
+            app.notice("read-only mode — only read and grep are available".into())
+        }
+        crate::core::cli::ToolMode::None => {
+            app.notice("no-tools mode — provider requests contain no tool schemas".into())
+        }
+        crate::core::cli::ToolMode::All => {}
     }
     if crate::core::config::trust::status(&app.agent.cwd()).is_none() {
         app.trust = Some(TrustStage { selected: 0 });
@@ -1500,38 +1563,10 @@ pub async fn run(
             ));
         }
     }
-    // -c continues this workspace's most recent session. Only the flags e
-    // actually knows are removed from the prompt — a word like `-O2` is
-    // prompt content, and `--` ends flag parsing entirely.
-    let mut continue_flag = false;
-    let mut resume_flag = false;
-    let mut message_args: Vec<&str> = Vec::new();
-    let mut past_flags = false;
-    for arg in &args {
-        if !past_flags {
-            match arg.as_str() {
-                "--" => {
-                    past_flags = true;
-                    continue;
-                }
-                "-c" | "--continue" => {
-                    continue_flag = true;
-                    continue;
-                }
-                "-r" | "--resume" => {
-                    resume_flag = true;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        message_args.push(arg);
-    }
-    let initial: String = message_args.join(" ");
-    if resume_flag {
+    if resume_session {
         // The reference behavior: launch straight into the session picker.
         app.open_resume_menu();
-    } else if continue_flag {
+    } else if continue_session {
         app.resume_recent();
     }
 
@@ -1551,9 +1586,9 @@ pub async fn run(
 
     // A -r launch prompt must wait for the session pick, or it would start a
     // turn whose reply splices into whichever session gets selected.
-    let hold_initial = app.trust.is_some() || (resume_flag && app.menu.is_some());
+    let hold_initial = app.trust.is_some() || (resume_session && app.menu.is_some());
     if let Some(initial) = stage_initial_prompt(initial, hold_initial, &mut app.pending_initial) {
-        app.submit(initial);
+        app.submit_initial(initial);
     }
     painter.frame(app.frame(cols as usize));
 
@@ -1647,7 +1682,7 @@ pub async fn run(
                                             // session pick then refuses.
                                             if app.menu.is_none() {
                                                 if let Some(initial) = app.pending_initial.take() {
-                                                    app.submit(initial);
+                                                    app.submit_initial(initial);
                                                 }
                                             }
                                         }
@@ -2341,10 +2376,17 @@ mod tests {
             id: "m".into(),
             base_url: "http://localhost".into(),
             api: crate::core::providers::catalog::Api::Completions,
+            catalog: crate::core::providers::registry::CatalogStrategy::Openai,
+            responses_mount: crate::core::providers::registry::ResponsesMount::Platform,
+            provider_supports_tools: true,
+            provider_image_input: false,
             efforts: Vec::new(),
             thinking: crate::core::providers::catalog::Thinking::Manual,
             context_window: 200_000,
             max_output: None,
+            supports_tools: true,
+            image_input: false,
+            pricing: None,
         });
         let (jobs, _) = tokio::sync::mpsc::channel(1);
         let (logins, _) = tokio::sync::mpsc::channel(1);
@@ -2377,6 +2419,7 @@ mod tests {
             held_prompts: Vec::new(),
             trust: None,
             pending_initial: None,
+            pending_initial_images: Vec::new(),
             shell_block: None,
             reloading: false,
             reload_block: None,
