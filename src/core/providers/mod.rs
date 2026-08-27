@@ -229,6 +229,33 @@ impl ChatMessage {
     }
 }
 
+/// Drop images the selected model can't accept from a request's message
+/// history — a resumed session, or a mid-session model switch, can carry
+/// image-bearing turns from an earlier, image-capable model forward to one
+/// that isn't. `load_images` already refuses a *new* attachment against an
+/// incompatible model; this is the historical case, where sending the
+/// request unchanged would get the whole turn rejected by a backend that
+/// doesn't understand image content at all. Never touches the session's
+/// own stored history — callers pass their own copy of it (the agent turn
+/// loop's `messages`, cloned fresh from `history` each step).
+pub fn strip_incompatible_images(messages: &mut [ChatMessage], model: &Model) {
+    if model.image_input {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message.images.is_empty() {
+            continue;
+        }
+        let count = message.images.len();
+        message.images.clear();
+        message.content.push_str(&format!(
+            "\n\n[{count} image{} omitted: {} is not declared image-capable]",
+            if count == 1 { "" } else { "s" },
+            catalog::slug(model)
+        ));
+    }
+}
+
 /// Why a provider request failed, and what that implies for retrying it. The
 /// retry decision hangs off this alone, never off matching message text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,5 +897,70 @@ mod tests {
         let error = ImageInput::from_path_with_size(&path).unwrap_err();
         assert!(error.contains("exceeds 20 MiB"), "{error}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn image_incapable_model() -> Model {
+        Model {
+            provider: "test".into(),
+            id: "test".into(),
+            base_url: "https://example.invalid".into(),
+            api: Api::Completions,
+            catalog: crate::core::providers::registry::CatalogStrategy::Openai,
+            responses_mount: crate::core::providers::registry::ResponsesMount::Platform,
+            provider_supports_tools: true,
+            provider_image_input: false,
+            efforts: Vec::new(),
+            thinking: crate::core::providers::catalog::Thinking::Manual,
+            context_window: 200_000,
+            max_output: None,
+            supports_tools: true,
+            image_input: false,
+            pricing: None,
+        }
+    }
+
+    #[test]
+    fn strip_incompatible_images_clears_history_the_model_cannot_accept() {
+        let mut messages = vec![
+            ChatMessage::user("plain text, no images"),
+            ChatMessage::user_with_images(
+                "an old image",
+                vec![ImageInput {
+                    media_type: "image/png".into(),
+                    data: std::sync::Arc::from("data"),
+                }],
+            ),
+        ];
+        strip_incompatible_images(&mut messages, &image_incapable_model());
+        assert!(messages[0].images.is_empty());
+        assert_eq!(messages[0].content, "plain text, no images");
+        assert!(messages[1].images.is_empty(), "the image must be removed");
+        assert!(
+            messages[1]
+                .content
+                .contains("is not declared image-capable"),
+            "the omission should be noted, not silent: {}",
+            messages[1].content
+        );
+    }
+
+    #[test]
+    fn strip_incompatible_images_leaves_a_capable_model_untouched() {
+        let mut model = image_incapable_model();
+        model.image_input = true;
+        let mut messages = vec![ChatMessage::user_with_images(
+            "an image",
+            vec![ImageInput {
+                media_type: "image/png".into(),
+                data: std::sync::Arc::from("data"),
+            }],
+        )];
+        strip_incompatible_images(&mut messages, &model);
+        assert_eq!(
+            messages[0].images.len(),
+            1,
+            "capable models keep their images"
+        );
+        assert_eq!(messages[0].content, "an image");
     }
 }

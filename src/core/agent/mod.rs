@@ -582,11 +582,22 @@ impl Agent {
                     log.commit(ChatMessage::user(message));
                 }
 
-                let messages = { history.lock().unwrap().clone() };
+                let mut messages = { history.lock().unwrap().clone() };
                 // Some compatible gateways omit usage entirely. Keep a local,
                 // conservative fallback so the mid-turn safety guard still
-                // exists there; a real Usage frame replaces it below.
+                // exists there; a real Usage frame replaces it below. Sized
+                // against history before the image strip below, so it stays
+                // the conservative side of what's actually sent.
                 let mut last_context = compact::estimate_request_tokens(&system, &messages);
+                // A resumed session, or a mid-session model switch, can carry
+                // image-bearing turns forward from an earlier, image-capable
+                // model to one that isn't — this is the one place every
+                // frontend's outgoing request passes through, so it's the one
+                // place that needs to know. This only edits the local copy
+                // just cloned from `history` above; the session's own stored
+                // record keeps its images regardless of what model sends the
+                // next turn.
+                providers::strip_incompatible_images(&mut messages, &model);
                 let request = Request {
                     model: model.clone(),
                     system: system.clone(),
