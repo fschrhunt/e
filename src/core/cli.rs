@@ -52,6 +52,7 @@ const ALL_FLAGS: &[&str] = &[
     "--ro",
     "--no-tools",
     "--nt",
+    "--no-network",
     "--json",
     "-j",
     "--model",
@@ -398,6 +399,14 @@ mod tests {
     fn raw_scan_finds_subcommands_and_stops_at_the_delimiter() {
         assert_eq!(
             leading_subcommand(&args(&["doctor", "--no-network"])),
+            Some("doctor")
+        );
+        // A known bool flag before the command must not swallow it: with
+        // --no-network absent from ALL_FLAGS this returned None, so doctor was
+        // never detected and extensions launched, breaking its no-network
+        // contract.
+        assert_eq!(
+            leading_subcommand(&args(&["--no-network", "doctor"])),
             Some("doctor")
         );
         // An undeclared extension flag takes the next token as its value.
