@@ -342,6 +342,9 @@ impl Block {
                 // same column as the user rail — never indented.
                 let marker = bold(&theme.fg("userMessageText", "●"));
                 let mut rows = vec![format!("{marker} {}", theme.fg("statusline", &self.text))];
+                const MAX_TREE_ROWS: usize = 8;
+                let overflow = self.tool_children.len().saturating_sub(MAX_TREE_ROWS - 1);
+                let shown = self.tool_children.len() - overflow;
                 if self.tool_children.is_empty() {
                     for (i, child) in self.children.iter().enumerate() {
                         let connector = if i + 1 == self.children.len() {
@@ -353,15 +356,12 @@ impl Block {
                     }
                     return rows;
                 }
-                for (index, child) in self.tool_children.iter().enumerate() {
+                for (index, child) in self.tool_children.iter().take(shown).enumerate() {
                     if child.state == ToolState::Pending {
                         continue;
                     }
-                    let connector = if index + 1 == self.tool_children.len() {
-                        "└"
-                    } else {
-                        "├"
-                    };
+                    let last = index + 1 == shown && overflow == 0;
+                    let connector = if last { "└" } else { "├" };
                     let connector = match child.state {
                         ToolState::Running if blink_on => theme.fg("userMessageText", connector),
                         ToolState::Running => theme.fg("dim", connector),
@@ -401,6 +401,16 @@ impl Block {
                     };
                     rows.push(format!("{connector} {}", theme.fg("statusline", &label)));
                     append_tool_preview(&mut rows, child, theme);
+                }
+                // A merged tree grows across every silent batch; cap the
+                // rows so a long chain cannot flood the screen. The header
+                // carries the full tallies.
+                if overflow > 0 {
+                    rows.push(format!(
+                        "{} {}",
+                        theme.fg("muted", "└"),
+                        theme.fg("muted", &format!("… {overflow} more tool calls"))
+                    ));
                 }
                 rows
             }
@@ -612,6 +622,40 @@ impl Transcript {
         }
         flush_run(&mut out, &mut run);
         self.blocks = out;
+    }
+
+    /// The tree a new batch should continue: the last block, walking back
+    /// over collapsed thinking summaries, when it is a live tool group.
+    /// Assistant text, the user, notices, and errors all separate trees.
+    fn open_tool_group(&self) -> Option<usize> {
+        for (index, block) in self.blocks.iter().enumerate().rev() {
+            match block.kind {
+                Kind::Thinking => continue,
+                Kind::ToolGroup if !block.done => return Some(index),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Continue the open tool tree with a new batch, or start one. Batches
+    /// with no assistant voice between them — only collapsed thinking, whose
+    /// summary rows the merge absorbs — are one tree, so a silently
+    /// tool-chaining agent reads as a single growing tree.
+    pub fn extend_tool_group(&mut self, children: Vec<ToolChild>) -> usize {
+        if let Some(idx) = self.open_tool_group() {
+            // Everything after the group is absorbed thinking: drop it so
+            // the continued rows sit directly under their tree.
+            self.blocks.truncate(idx + 1);
+        }
+        let idx = self
+            .open_tool_group()
+            .unwrap_or_else(|| self.push(Block::tool_group(Vec::new())));
+        let block = &mut self.blocks[idx];
+        block.tool_children.extend(children);
+        block.refresh_tool_header();
+        block.touch();
+        idx
     }
 
     pub fn render(&mut self, theme: &Theme, width: usize) -> Vec<String> {
