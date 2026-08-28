@@ -344,7 +344,16 @@ impl Block {
                 let mut rows = vec![format!("{marker} {}", theme.fg("statusline", &self.text))];
                 const MAX_TREE_ROWS: usize = 8;
                 let overflow = self.tool_children.len().saturating_sub(MAX_TREE_ROWS - 1);
-                let shown = self.tool_children.len() - overflow;
+                // The most recent calls keep their rows — that is where the
+                // live activity is — and the earliest ones fold into a
+                // count above them. The header carries the full tallies.
+                if overflow > 0 {
+                    rows.push(format!(
+                        "{} {}",
+                        theme.fg("muted", "├"),
+                        theme.fg("muted", &format!("… {overflow} earlier tool calls"))
+                    ));
+                }
                 if self.tool_children.is_empty() {
                     for (i, child) in self.children.iter().enumerate() {
                         let connector = if i + 1 == self.children.len() {
@@ -356,11 +365,11 @@ impl Block {
                     }
                     return rows;
                 }
-                for (index, child) in self.tool_children.iter().take(shown).enumerate() {
+                for (index, child) in self.tool_children.iter().skip(overflow).enumerate() {
                     if child.state == ToolState::Pending {
                         continue;
                     }
-                    let last = index + 1 == shown && overflow == 0;
+                    let last = index + overflow + 1 == self.tool_children.len();
                     let connector = if last { "└" } else { "├" };
                     let connector = match child.state {
                         ToolState::Running if blink_on => theme.fg("userMessageText", connector),
@@ -401,16 +410,6 @@ impl Block {
                     };
                     rows.push(format!("{connector} {}", theme.fg("statusline", &label)));
                     append_tool_preview(&mut rows, child, theme);
-                }
-                // A merged tree grows across every silent batch; cap the
-                // rows so a long chain cannot flood the screen. The header
-                // carries the full tallies.
-                if overflow > 0 {
-                    rows.push(format!(
-                        "{} {}",
-                        theme.fg("muted", "└"),
-                        theme.fg("muted", &format!("… {overflow} more tool calls"))
-                    ));
                 }
                 rows
             }

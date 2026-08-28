@@ -444,9 +444,10 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
     assert_eq!(t.blocks.len(), 3);
     assert_eq!(t.blocks[2].text, "1 tool call \u{b7} 1 read");
 
-    // Past the row cap the tallies stay complete and the tail names the
-    // remainder instead of flooding the screen. (Rows render once a call
-    // leaves its pending state, so start them.)
+    // Past the row cap the tallies stay complete; the most recent calls
+    // keep their rows and the earliest ones collapse into a count above
+    // them. (Rows render once a call leaves its pending state, so start
+    // them.)
     let many = (0..12).map(|i| read(10 + i, &format!("{i}.rs"))).collect();
     t.extend_tool_group(many);
     assert_eq!(t.blocks[2].text, "13 tool calls \u{b7} 13 read");
@@ -454,8 +455,12 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
         t.blocks[2].start_tool(id);
     }
     let rows = t.blocks[2].lines_for_test(&theme, 80);
-    assert_eq!(rows.len(), 1 + 7 + 1, "header, capped rows, overflow tail");
-    assert!(rows.last().unwrap().contains("\u{2026} 6 more tool calls"));
+    assert_eq!(rows.len(), 1 + 1 + 7, "header, overflow count, recent rows");
+    assert!(rows[1].contains("\u{2026} 6 earlier tool calls"));
+    // The recent tail survives; the oldest work is what got folded away.
+    assert!(rows[2].contains("Reading 5.rs"));
+    assert!(rows.last().unwrap().contains("Reading 11.rs"));
+    assert!(!rows.iter().any(|line| line.contains("Reading c.rs")));
 }
 
 #[test]
