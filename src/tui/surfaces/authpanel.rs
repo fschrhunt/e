@@ -16,7 +16,7 @@
 
 use crate::core::auth::{self};
 use crate::tui::markdown::visible_width;
-use crate::tui::render::bold;
+use crate::tui::render::{self, bold};
 use crate::tui::theme::Theme;
 
 pub enum AuthStage {
@@ -132,9 +132,10 @@ pub fn render(stage: &AuthStage, theme: &Theme, width: usize, mask_count: usize)
                 ));
             }
             rows.push(String::new());
-            rows.push(dim(
-                "   ↑↓ Choose · Enter Continue · Backspace Back · Esc Close",
-            ));
+            rows.push(dim(&format!(
+                "   ↑↓ Choose · Enter Continue · {} Back · Esc Close",
+                render::backspace_label(),
+            )));
             rows
         }
         AuthStage::Key { selected } => {
@@ -163,9 +164,10 @@ pub fn render(stage: &AuthStage, theme: &Theme, width: usize, mask_count: usize)
                 ));
             }
             rows.push(String::new());
-            rows.push(dim(
-                "   ↑↓ Choose · Enter Continue · Backspace Back · Esc Close",
-            ));
+            rows.push(dim(&format!(
+                "   ↑↓ Choose · Enter Continue · {} Back · Esc Close",
+                render::backspace_label(),
+            )));
             rows
         }
         AuthStage::ApiKey { provider } => {
@@ -191,7 +193,10 @@ pub fn render(stage: &AuthStage, theme: &Theme, width: usize, mask_count: usize)
                     crate::core::providers::catalog::display_name(provider)
                 )),
                 entry,
-                dim("   Enter saves · Backspace Back · Esc Close"),
+                dim(&format!(
+                    "   Enter saves · {} Back · Esc Close",
+                    render::backspace_label()
+                )),
             ]
         }
         AuthStage::Waiting { .. } => vec![
@@ -199,7 +204,10 @@ pub fn render(stage: &AuthStage, theme: &Theme, width: usize, mask_count: usize)
             dim("   Sign in with an account"),
             String::new(),
             dim("   Waiting for authorization in the browser…"),
-            dim("   Backspace cancels sign-in · Esc Close"),
+            dim(&format!(
+                "   {} cancels sign-in · Esc Close",
+                render::backspace_label()
+            )),
         ],
         AuthStage::Done { ok, message, .. } => {
             let head = if *ok {
