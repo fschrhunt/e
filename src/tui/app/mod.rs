@@ -1794,7 +1794,10 @@ pub async fn run(
                                 KeyCode::Down => panel.step(1),
                                 KeyCode::Left => setting_error = panel.change(-1).err(),
                                 KeyCode::Right => setting_error = panel.change(1).err(),
-                                KeyCode::Esc | KeyCode::Enter => app.settings = None,
+                                // Esc alone closes: Enter opens the panel
+                                // from the command menu, so it must not be
+                                // the same key that dismisses it.
+                                KeyCode::Esc => app.settings = None,
                                 _ => {}
                             }
                             if let Some(error) = setting_error {
