@@ -704,3 +704,52 @@ async fn a_sleep_before_any_output_replays_invisibly() {
     assert!(!saw_steered, "nothing streamed, so no continuation turn");
     assert!(!errored);
 }
+
+// Reaching the continuation cap is a stop, not a silent recovery: after the
+// last allowed continuation the next mid-reply sleep must stop the turn in the
+// cancel family (SleepStopped + "continuation cap" warning + aborted end) and
+// must NOT commit the truncated reply as a normal turn or run its tool calls.
+// Regression for the cap branch omitting `errored`, which let execution fall
+// through to the success path.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn reaching_the_continuation_cap_stops_the_turn() {
+    let _lock = env_lock();
+    // Four mid-reply losses: three continuations (cap is 3), the fourth caps.
+    let port = sleepy_server(vec![Act::Hold, Act::Hold, Act::Hold, Act::Hold]);
+    let _home = mock_home();
+
+    let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
+    agent.submit("hi".into(), "sys".into());
+
+    let mut slept = 0;
+    let mut stopped = false;
+    let mut saw_cap_warning = false;
+    let mut aborted = false;
+    let mut errored = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            // Each attempt streams one delta before the socket drops; wake the
+            // machine while that attempt is in flight so every loss is a
+            // mid-reply sleep under the window.
+            SessionEvent::TextDelta(_) => agent.inject_sleep_gap(Duration::from_secs(60)),
+            SessionEvent::Slept { .. } => slept += 1,
+            SessionEvent::SleepStopped { .. } => stopped = true,
+            SessionEvent::Warning(message) => {
+                if message.contains("continuation cap") {
+                    saw_cap_warning = true;
+                }
+            }
+            SessionEvent::Error(_) => errored = true,
+            SessionEvent::TurnEnd { aborted: a } => {
+                aborted = a;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(slept, 3, "exactly the three allowed continuations resumed");
+    assert!(stopped && saw_cap_warning, "the cap stop is announced");
+    assert!(aborted, "the turn ends aborted, not as a normal completion");
+    assert!(!errored, "the cap stop is a stop, not an error");
+}

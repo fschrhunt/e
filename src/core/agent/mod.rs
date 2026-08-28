@@ -956,6 +956,15 @@ impl Agent {
                                         )))
                                         .await;
                                     handle.abort();
+                                    // Enter the cancel-family stop path (like
+                                    // the past-window branch above): commit the
+                                    // partial once, synthesize results for any
+                                    // unrun calls, and end the turn. Without
+                                    // `errored` the stop block is skipped and
+                                    // the half-streamed reply is committed as a
+                                    // normal turn — running its tool calls after
+                                    // the run was already reported stopped.
+                                    errored = true;
                                     sleep_stopped = true;
                                     break 'stream;
                                 }
