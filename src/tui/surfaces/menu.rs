@@ -65,7 +65,8 @@ pub struct Menu {
 }
 
 pub const HINT_USE: &str = "↑↓ Navigate     Enter Use     Esc Close";
-pub const HINT_SCOPED: &str = "↑↓ Navigate     Space Toggle     Ctrl+X Reset     Enter Done";
+pub const HINT_SCOPED: &str =
+    "↑↓ Navigate     Space Toggle     Ctrl+X Reset     Enter Done     Esc Close";
 /// The reference keeps six selectable rows below the header.
 const MAX_VISIBLE: usize = 6;
 

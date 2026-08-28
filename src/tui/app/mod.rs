@@ -297,7 +297,7 @@ impl App {
         }
         rows.push(self.theme.fg(
             "statusline",
-            "Full detail · ←/→ switch · ctrl o close · ↑↓ scroll · Esc close",
+            "Full detail · ←/→ switch · ↑↓/pgup·pgdn scroll · ctrl o close · Esc close",
         ));
         rows
     }
