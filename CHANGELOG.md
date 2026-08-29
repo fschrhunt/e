@@ -14,8 +14,9 @@ release notes are that section verbatim), open a fresh empty
     context percent, muted — the extra segments (sign-in nudge, queue
     counts, effort, session title, `Context: 12k/200k`, workspace tail and
     git branch) are gone.
-  - The activity row wears one tone: dot, verb, elapsed, and the token
-    tail all in the accent — no dim half-color for the counts.
+  - The activity row's text wears one tone — verb, elapsed, and token
+    tail all dim, no second color for the counts — beside the accent
+    dot's unchanged presence-blink.
   - The `• Thinking (Ns) (↑… ↓…)` row persists through the whole turn —
     tool trees and streaming reply text included — instead of vanishing
     whenever the phase changed.

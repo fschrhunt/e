@@ -461,16 +461,16 @@ impl App {
                     // The activity dot runs on the same column as the user
                     // rail — flush left, no indent — and the row persists
                     // through every streaming phase: thinking, tool trees,
-                    // and reply text alike. The blink is presence, not
-                    // color: the dot shows and hides, no dim half-state
-                    // between. The whole label — verb, elapsed, and token
-                    // tail — wears the accent in one tone.
-                    let row = if blink_on {
-                        self.theme.fg("accent", &format!("• {label}"))
+                    // and reply text alike. The dot keeps its accent
+                    // presence-blink (shows and hides, no half-state); the
+                    // label — verb, elapsed, and token tail — reads in one
+                    // dim tone beside it.
+                    let dot = if blink_on {
+                        self.theme.fg("accent", "•")
                     } else {
-                        format!("  {}", self.theme.fg("accent", &label))
+                        " ".to_string()
                     };
-                    lines.push(row);
+                    lines.push(format!("{dot} {}", self.theme.fg("dim", &label)));
                 } else {
                     lines.push(label);
                 }
