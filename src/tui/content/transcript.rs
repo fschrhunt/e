@@ -99,9 +99,13 @@ pub struct Block {
     pub cancelled: bool,
     /// Command rows: the first output lines, shown as `│` rows beneath.
     pub preview: Vec<String>,
-    /// Output lines beyond the preview (drives the elision row).
+    /// More output rows than the preview shows (drives the elision row).
     pub more: usize,
     cache: Option<(usize, bool, Vec<String>)>,
+    /// Bumped on every touch — the review screen's cache key folds these
+    /// into one fingerprint so its projection rebuilds only when a block
+    /// actually changed.
+    generation: u64,
 }
 
 impl Block {
@@ -122,10 +126,12 @@ impl Block {
             preview: Vec::new(),
             more: 0,
             cache: None,
+            generation: 0,
         }
     }
 
     pub fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         self.cache = None;
     }
 
@@ -865,6 +871,17 @@ pub struct Transcript {
 }
 
 impl Transcript {
+    /// Everything block state can contribute to a rendering, as one
+    /// number: the block count and each block's touch generation. The
+    /// review screen folds this into its cache key.
+    pub fn fingerprint(&self) -> u64 {
+        self.blocks
+            .iter()
+            .fold(self.blocks.len() as u64, |acc, block| {
+                acc.rotate_left(1) ^ block.generation
+            })
+    }
+
     pub fn push(&mut self, block: Block) -> usize {
         self.blocks.push(block);
         self.blocks.len() - 1

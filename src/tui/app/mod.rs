@@ -68,6 +68,7 @@ struct ActiveTurn {
 /// The ctrl+o review screen: the whole transcript with tool details
 /// spliced in, at one of the reference's two depths — Review folds each
 /// detail to three lines behind a `→ to expand` hint, Full shows all.
+#[derive(Clone, Copy)]
 struct Viewer {
     full: bool,
     scroll: usize,
@@ -266,6 +267,11 @@ struct App {
     output_seq: u64,
     /// The ctrl+o full-detail viewer, when open.
     viewer: Option<Viewer>,
+    /// The review screen's projected rows, cached between frames: the
+    /// projection only rebuilds when the transcript or the output store
+    /// changed (the cache's fingerprint), or the width or depth moved —
+    /// not on every 33ms paint.
+    viewer_cache: Option<(u64, usize, bool, Vec<String>)>,
     /// The ask tool's open question, and any batch-mates queued behind it.
     question: Option<crate::tui::questionpanel::Question>,
     question_queue: std::collections::VecDeque<crate::tui::questionpanel::Question>,
@@ -294,10 +300,36 @@ struct App {
 }
 
 impl App {
-    /// The review screen's body: the whole transcript, with each child
-    /// row's stored detail railed beneath it — folded to three lines behind
-    /// the reference's `→ to expand` hint at Review depth, whole at Full.
-    fn viewer_rows(&self, width: usize, full: bool) -> Vec<String> {
+    /// The review screen's cached body: the projected transcript rows,
+    /// rebuilt only when the cache's fingerprint no longer matches. The
+    /// fingerprint covers everything the projection reads — block state
+    /// (each block's generation, bumped on every touch), the block count,
+    /// and the output store's seq (new details and eviction).
+    fn viewer_rows(&mut self, width: usize, full: bool) -> &[String] {
+        let fingerprint = self.viewer_fingerprint();
+        let current = match &self.viewer_cache {
+            Some((cached_fp, cached_width, cached_full, _)) => {
+                *cached_fp == fingerprint && *cached_width == width && *cached_full == full
+            }
+            None => false,
+        };
+        if !current {
+            let rows = self.project_rows(width, full);
+            self.viewer_cache = Some((fingerprint, width, full, rows));
+        }
+        &self.viewer_cache.as_ref().unwrap().3
+    }
+
+    /// Everything the review projection reads, as one number.
+    fn viewer_fingerprint(&self) -> u64 {
+        self.transcript.fingerprint() ^ self.output_seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// The projection itself, pure over the current transcript: the whole
+    /// transcript with each child row's stored detail railed beneath it —
+    /// folded to three lines behind the reference's `→ to expand` hint at
+    /// Review depth, whole at Full.
+    fn project_rows(&self, width: usize, full: bool) -> Vec<String> {
         const REVIEW_DETAIL_LINES: usize = 3;
         let mut rows: Vec<String> = Vec::new();
         for block in &self.transcript.blocks {
@@ -352,8 +384,8 @@ impl App {
     /// The ctrl+o review screen: a scroll window over the projected
     /// transcript, the `┃ Review …` navigation row at the bottom — the
     /// reference's own wording per depth.
-    fn viewer_frame(&self, width: usize, height: usize) -> Vec<String> {
-        let Some(viewer) = &self.viewer else {
+    fn viewer_frame(&mut self, width: usize, height: usize) -> Vec<String> {
+        let Some(viewer) = self.viewer else {
             return Vec::new();
         };
         let body = self.viewer_rows(width, viewer.full);
@@ -415,9 +447,6 @@ impl App {
         ))
     }
 
-    /// The workspace's current git branch, from `.git/HEAD` — a plain file
-    /// read, no subprocess, absent outside a repository or on a detached
-    /// HEAD. Follows one `gitdir:` indirection for worktrees.
     fn frame(&mut self, width: usize, height: usize) -> Vec<String> {
         let blink_on = self
             .active
@@ -685,12 +714,22 @@ impl App {
                     stash(&mut review, self.editor.text());
                 }
                 if review.dirty.iter().any(|d| *d) {
-                    // Edits that trimmed away entirely drop their entry.
+                    // Only edited entries rewrite: a trim drops an entry that
+                    // emptied, and leaves untouched entries verbatim — a
+                    // multi-line prompt's trailing newline is not the user's
+                    // doing.
                     let entries: Vec<String> = review
                         .entries
                         .iter()
-                        .map(|e| e.trim().to_string())
-                        .filter(|e| !e.is_empty())
+                        .zip(&review.dirty)
+                        .filter_map(|(entry, dirty)| {
+                            if !dirty {
+                                Some(entry.clone())
+                            } else {
+                                let trimmed = entry.trim().to_string();
+                                (!trimmed.is_empty()).then_some(trimmed)
+                            }
+                        })
                         .collect();
                     self.agent.set_queued(entries);
                 }
@@ -735,8 +774,20 @@ impl App {
         let cwd = crate::core::session::normalized_cwd(&self.agent.cwd());
         // Every workspace's sessions, with a Tab-cycled scope filter that
         // opens on the current workspace. Each row carries the reference's
-        // dim right cluster: `workspace · age · N turns`.
-        let items: Vec<MenuItem> = crate::core::session::list_all()
+        // dim right cluster: `workspace · age · N turns`. A workspace's own
+        // directory name stands in for it when unique across the list; two
+        // `proj` directories fall back to the full `~`-collapsed path so
+        // the rows stay distinguishable.
+        let listed = crate::core::session::list_all();
+        let mut tail_counts = std::collections::HashMap::<String, usize>::new();
+        for info in &listed {
+            if let Some(tail) = info.cwd.file_name() {
+                *tail_counts
+                    .entry(tail.to_string_lossy().into_owned())
+                    .or_default() += 1;
+            }
+        }
+        let items: Vec<MenuItem> = listed
             .into_iter()
             .map(|info| {
                 let mut item = MenuItem::new(
@@ -748,11 +799,16 @@ impl App {
                     "",
                     &info.path.to_string_lossy(),
                 );
-                let workspace = info
+                let tail = info
                     .cwd
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let workspace = if tail_counts.get(&tail).copied().unwrap_or(0) > 1 {
+                    collapse_home(&info.cwd)
+                } else {
+                    tail
+                };
                 let turns = format!(
                     "{} {}",
                     info.user_turns,
@@ -1682,6 +1738,19 @@ fn title_path_from(cwd: &std::path::Path, home: &str) -> String {
     }
 }
 
+/// The path as `~/…` when it lives under $HOME, whole otherwise — the
+/// statusline's identity tail and the picker workspace labels share the
+/// shape.
+fn collapse_home(path: &std::path::Path) -> String {
+    let shown = path.to_string_lossy().into_owned();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
+            format!("~{}", &shown[home.len()..])
+        }
+        _ => shown,
+    }
+}
+
 fn ago(ms: u64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2022,6 +2091,7 @@ pub async fn run(
         outputs: Vec::new(),
         output_seq: 0,
         viewer: None,
+        viewer_cache: None,
         question: None,
         question_queue: std::collections::VecDeque::new(),
         queue_review: None,
@@ -3135,6 +3205,7 @@ mod tests {
             outputs: Vec::new(),
             output_seq: 0,
             viewer: None,
+            viewer_cache: None,
             question: None,
             question_queue: std::collections::VecDeque::new(),
             queue_review: None,
@@ -3155,6 +3226,104 @@ mod tests {
         assert!(!app.queue_review_key(KeyCode::Up));
         assert!(app.queue_review.is_none());
         assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn queue_review_commit_leaves_untouched_entries_verbatim() {
+        let mut app = session_app();
+        app.on_session_event(SessionEvent::TurnStart);
+        app.queue_review = Some(QueueReview {
+            // The untouched entry carries a trailing newline a blanket trim
+            // would silently strip; only the edited entry may rewrite.
+            entries: vec!["keep  me\n".into(), "old draft".into()],
+            dirty: vec![false, true],
+            selected: 1,
+            visible: true,
+        });
+        app.editor.set_text("  new draft  ");
+
+        assert!(app.queue_review_key(KeyCode::Enter));
+
+        let entries = app.agent.pause_queue();
+        assert_eq!(
+            entries,
+            vec!["keep  me\n".to_string(), "new draft".to_string()]
+        );
+        app.agent.resume_queue();
+    }
+
+    #[test]
+    fn queue_review_commit_drops_an_entry_edited_to_empty() {
+        let mut app = session_app();
+        app.on_session_event(SessionEvent::TurnStart);
+        app.queue_review = Some(QueueReview {
+            entries: vec!["first".into(), "second".into()],
+            dirty: vec![false, true],
+            selected: 1,
+            visible: true,
+        });
+        app.editor.set_text("   ");
+
+        assert!(app.queue_review_key(KeyCode::Enter));
+
+        let entries = app.agent.pause_queue();
+        assert_eq!(entries, vec!["first".to_string()]);
+        app.agent.resume_queue();
+    }
+
+    #[test]
+    fn review_screen_rebuilds_after_transcript_changes() {
+        let mut app = session_app();
+        app.viewer = Some(Viewer {
+            full: false,
+            scroll: 0,
+        });
+        app.transcript
+            .push(Block::new(Kind::User, "before the change"));
+        let before = app.viewer_rows(80, false).to_vec();
+
+        // Same width and depth, new block: the cache must notice.
+        app.transcript
+            .push(Block::new(Kind::User, "after the change"));
+        let after = app.viewer_rows(80, false).to_vec();
+
+        assert_eq!(after.len(), before.len() + 2, "block plus its gap row");
+        assert!(after.last().unwrap().contains("after the change"));
+    }
+
+    #[test]
+    fn review_screen_rebuilds_when_a_tool_reports() {
+        let mut app = session_app();
+        app.viewer = Some(Viewer {
+            full: false,
+            scroll: 0,
+        });
+        let child = crate::tui::transcript::ToolChild::pending(
+            7,
+            "command".into(),
+            "Running true".into(),
+            "Ran true".into(),
+            "true".into(),
+        );
+        let block = app.transcript.push(Block::tool_group(vec![child]));
+        app.on_session_event(SessionEvent::TurnStart);
+        app.on_session_event(SessionEvent::ToolStart { id: 7 });
+        let running = app.viewer_rows(80, false).to_vec();
+
+        app.active.as_mut().unwrap().tool_blocks.insert(7, block);
+        app.on_session_event(SessionEvent::ToolEnd {
+            id: 7,
+            outcome: crate::core::tools::ToolOutcome::Completed,
+            summary: "done".into(),
+            content: "full saved output".into(),
+        });
+        let reported = app.viewer_rows(80, false).to_vec();
+
+        assert!(
+            reported.iter().any(|row| row.contains("full saved output")),
+            "the new detail must appear without a width or depth change"
+        );
+        assert_ne!(running, reported);
     }
 
     #[test]

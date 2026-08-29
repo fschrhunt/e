@@ -391,6 +391,12 @@ pub struct Agent {
     /// Ask-tool calls waiting on the user, keyed by tool id. The panel
     /// answers through [`Agent::answer`]; Esc resolves them as cancelled.
     asks: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Option<String>>>>>,
+    /// Wakeup for the turn loop's hold-open wait: any change to the state
+    /// it sleeps on — a queued prompt, the review committing, the pause
+    /// lifting, an interrupt — notifies. Signals carry no payload; the
+    /// waiter re-reads state, so a signal that races a check is never
+    /// lost (Notify stores a permit for a not-yet-waiting waiter).
+    pending_signal: Arc<tokio::sync::Notify>,
     options: AgentOptions,
 }
 
@@ -418,6 +424,7 @@ impl Agent {
             persist_warned: Arc::new(AtomicBool::new(false)),
             tool_seq: Arc::new(AtomicU64::new(0)),
             asks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending_signal: Arc::new(tokio::sync::Notify::new()),
             wake: wake::shared(),
             options,
         };
@@ -621,6 +628,7 @@ impl Agent {
     /// Replace the queue wholesale (the review committing its edits).
     pub fn set_queued(&self, items: Vec<String>) {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).items = items;
+        self.pending_signal.notify_one();
     }
 
     /// Resume queue draining after a review closes.
@@ -629,6 +637,7 @@ impl Agent {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .paused = false;
+        self.pending_signal.notify_one();
     }
 
     /// Resolve a waiting ask-tool call: `Some(text)` is the user's answer,
@@ -682,6 +691,7 @@ impl Agent {
                 .unwrap_or_else(|e| e.into_inner())
                 .items
                 .push(message.content);
+            self.pending_signal.notify_one();
             return true;
         }
         self.log().commit(message);
@@ -701,6 +711,7 @@ impl Agent {
         let cwd = self.cwd.clone();
         let effort = self.effort();
         let pending = self.pending.clone();
+        let pending_signal = self.pending_signal.clone();
         let host = self.host.clone();
         let tool_seq = self.tool_seq.clone();
         let wake = self.wake.clone();
@@ -763,7 +774,11 @@ impl Agent {
                 };
                 for message in steered {
                     let _ = events.send(SessionEvent::Steered(message.clone())).await;
-                    log.commit_async(ChatMessage::user(message)).await;
+                    // Harness-authored: steering echoes and continuations
+                    // fill the history but are not user turns.
+                    let mut recorded = ChatMessage::user(message);
+                    recorded.internal = true;
+                    log.commit_async(recorded).await;
                 }
 
                 let mut messages = { history.lock().unwrap_or_else(|e| e.into_inner()).clone() };
@@ -1161,8 +1176,11 @@ impl Agent {
                                 duration_secs: duration.as_secs(),
                             })
                             .await;
-                        log.commit_async(ChatMessage::user(SLEEP_CONTINUATION.to_string()))
-                            .await;
+                        // Harness-authored: the wake continuation fills
+                        // the history but is not a user turn.
+                        let mut recorded = ChatMessage::user(SLEEP_CONTINUATION.to_string());
+                        recorded.internal = true;
+                        log.commit_async(recorded).await;
                         let _ = events
                             .send(SessionEvent::Steered(SLEEP_CONTINUATION.to_string()))
                             .await;
@@ -1228,6 +1246,9 @@ impl Agent {
                     // queued-prompt review holds the queue, the turn holds
                     // open here instead of consuming or stranding it.
                     loop {
+                        if cancel.load(Ordering::SeqCst) {
+                            break 'turn true;
+                        }
                         let (empty, paused) = {
                             let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
                             (pending.items.is_empty(), pending.paused)
@@ -1238,9 +1259,10 @@ impl Agent {
                         if !paused {
                             continue 'turn;
                         }
-                        if !sleep_cancellable(Duration::from_millis(100), &cancel).await {
-                            break 'turn true;
-                        }
+                        // Asleep until the state above can have changed —
+                        // a queued prompt, the review resuming, Esc. No
+                        // polling; see `pending_signal`.
+                        pending_signal.notified().await;
                     }
                 }
 
@@ -1404,6 +1426,8 @@ impl Agent {
 
     pub fn interrupt(&mut self) {
         self.cancel.store(true, Ordering::SeqCst);
+        // Wake the hold-open wait so it can observe the latch.
+        self.pending_signal.notify_one();
         if !self.running {
             let _ = self
                 .events
