@@ -170,6 +170,16 @@ pub struct ChatMessage {
     pub images: Vec<ImageInput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<MessageUsage>,
+    /// True for harness-authored user-role messages — steering echoes and
+    /// wake continuations. They fill the history but are not user turns
+    /// (the /resume picker's "N turns" excludes them); the flag never
+    /// reaches the provider wire.
+    #[serde(default, skip_serializing_if = "not_internal")]
+    pub internal: bool,
+}
+
+fn not_internal(internal: &bool) -> bool {
+    !internal
 }
 
 impl ChatMessage {
@@ -182,6 +192,7 @@ impl ChatMessage {
             tool_meta: None,
             images: Vec::new(),
             usage: None,
+            internal: false,
         }
     }
     pub fn assistant(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
@@ -193,6 +204,7 @@ impl ChatMessage {
             tool_meta: None,
             images: Vec::new(),
             usage: None,
+            internal: false,
         }
     }
     /// Attach the step's real usage — the agent commits assistant turns with
@@ -212,6 +224,7 @@ impl ChatMessage {
             tool_meta: None,
             images: Vec::new(),
             usage: None,
+            internal: false,
         }
     }
     pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -223,6 +236,7 @@ impl ChatMessage {
             tool_meta: None,
             images: Vec::new(),
             usage: None,
+            internal: false,
         }
     }
 
@@ -243,6 +257,7 @@ impl ChatMessage {
             }),
             images: Vec::new(),
             usage: None,
+            internal: false,
         }
     }
 
@@ -381,7 +396,9 @@ const QUOTA_EXHAUSTED_PATTERNS: &[&str] = &[
     "insufficient_quota",
     "out of budget",
     "quota exceeded",
-    "billing",
+    "billing limit",
+    "billing quota",
+    "billing cap",
 ];
 
 /// Error-body wording that marks a transient failure worth retrying
@@ -519,16 +536,14 @@ impl ProviderError {
     /// rejected request.
     pub fn from_status(status: reqwest::StatusCode, body: &str) -> Self {
         let status_cause = FailureCause::from_status(status);
+        let quota_can_override = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || (status.is_client_error() && status != reqwest::StatusCode::UNAUTHORIZED);
         let cause = match classify_text(body) {
-            Some(FailureCause::QuotaExhausted) => FailureCause::QuotaExhausted,
-            Some(text_cause) => {
-                if status_cause == FailureCause::Rejected {
-                    text_cause
-                } else {
-                    status_cause
-                }
+            Some(FailureCause::QuotaExhausted) if quota_can_override => {
+                FailureCause::QuotaExhausted
             }
-            None => status_cause,
+            Some(text_cause) if status_cause == FailureCause::Rejected => text_cause,
+            _ => status_cause,
         };
         let short = format!(
             "{} {}",
@@ -1033,6 +1048,16 @@ mod tests {
         assert_eq!(err(400, "model not found").cause, FailureCause::Rejected);
         assert_eq!(err(401, "overloaded").cause, FailureCause::Auth);
         assert_eq!(err(429, "").cause, FailureCause::RateLimited);
+        // Generic billing prose is not proof of exhausted quota, and a 5xx
+        // remains retryable even if its body mentions account-limit wording.
+        assert_eq!(
+            err(500, "billing service temporarily unavailable").cause,
+            FailureCause::ProviderUnavailable
+        );
+        assert_eq!(
+            err(500, "monthly usage limit reached").cause,
+            FailureCause::ProviderUnavailable
+        );
     }
 
     #[test]

@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 /// Total provider requests a single failure campaign gets, including the
-/// initial request, before the turn fails outright. The default; overridden
-/// by the `retry_max_attempts` setting (0 disables retrying).
+/// unavoidable initial request, before the turn fails outright. The default;
+/// overridden by `retry_max_attempts` (0 disables every follow-up request).
 pub const MAX_ATTEMPTS: u32 = 10;
 /// Hard bounds on the `retry_max_attempts` setting — a value outside this
 /// range reads as the default rather than being trusted.

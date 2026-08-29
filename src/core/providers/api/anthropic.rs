@@ -356,15 +356,17 @@ pub async fn run(
                     // API's way of saying "overloaded" or "rate limited"
                     // once a connection is already open, distinct from an
                     // HTTP status.
-                    let cause = match value["error"]["type"].as_str().unwrap_or("") {
-                        "overloaded_error" | "api_error" => FailureCause::ProviderUnavailable,
-                        "rate_limit_error" => FailureCause::RateLimited,
-                        "authentication_error" | "permission_error" => FailureCause::Auth,
-                        // An unrecognized type is still classified by its
-                        // own wording — a quota wall must not look
-                        // retryable just because its type name is new.
-                        _ => crate::core::providers::classify_text(&message)
-                            .unwrap_or(FailureCause::Rejected),
+                    let text_cause = crate::core::providers::classify_text(&message);
+                    let cause = if text_cause == Some(FailureCause::QuotaExhausted) {
+                        FailureCause::QuotaExhausted
+                    } else {
+                        match value["error"]["type"].as_str().unwrap_or("") {
+                            "overloaded_error" | "api_error" => FailureCause::ProviderUnavailable,
+                            "rate_limit_error" => FailureCause::RateLimited,
+                            "authentication_error" | "permission_error" => FailureCause::Auth,
+                            // Unknown types still get the message classifier.
+                            _ => text_cause.unwrap_or(FailureCause::Rejected),
+                        }
                     };
                     return Err(ProviderError::frame(message, cause));
                 }

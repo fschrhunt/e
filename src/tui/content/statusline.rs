@@ -57,16 +57,12 @@ fn clip(s: &str, max_chars: usize) -> String {
 pub use crate::core::output::format_elapsed;
 
 /// Per-turn token flow and focused activity phase. The display moves only
-/// on real provider usage frames — streamed bytes are never estimated into
-/// it, so invisible reasoning tokens can't balloon the numbers ahead of the
-/// truth (pi's model). `input` starts as a chars/4 seed of the request size
-/// until the first usage frame lands; `output` is real tokens only.
+/// on real provider usage frames — streamed bytes and request size are never
+/// estimated into it, so invisible reasoning or cached context can't balloon
+/// the numbers ahead of the truth (pi's model).
 pub struct Turn {
-    /// Latest request's full context, from real usage (a chars/4 seed until
-    /// the first report lands).
+    /// Latest request's full context, from real provider usage.
     pub input: u64,
-    /// True until a provider Usage frame replaces the chars/4 seed.
-    pub input_estimated: bool,
     /// Output tokens of completed steps, from real usage.
     pub output: u64,
     pub phase: TurnPhase,
@@ -86,7 +82,6 @@ impl Turn {
     pub fn new() -> Self {
         Turn {
             input: 0,
-            input_estimated: false,
             output: 0,
             phase: TurnPhase::Thinking,
             retry: None,
@@ -100,47 +95,54 @@ impl Turn {
     /// accumulates across the turn.
     pub fn note_usage(&mut self, input: u64, output: u64) {
         self.input = input;
-        self.input_estimated = false;
         self.output = self.output.saturating_add(output);
-    }
-
-    pub fn seed_input(&mut self, input: u64) {
-        self.input = input;
-        self.input_estimated = true;
     }
 
     pub fn tokens(&self) -> String {
         if self.input == 0 && self.output == 0 {
             String::new()
         } else {
-            let estimate = if self.input_estimated { "~" } else { "" };
+            // The reference compacts past a thousand — `(↑31 ↓9.6k)`.
             format!(
-                "(↑{estimate}{} ↓{})",
+                "(↑{} ↓{})",
                 format_tokens(self.input),
                 format_tokens(self.output)
             )
         }
     }
 
-    /// The tool phase renders inside its transcript group, not in a duplicate
-    /// footer row. Assistant text needs only markerless token progress. A
-    /// recovered flash overrides everything else until it expires.
+    /// The `Thinking (Ns) (↑… ↓…)` activity label. The clock keeps ticking
+    /// through tool and assistant-text phases alike, so the row never
+    /// vanishes mid-turn while a tree grows or a reply streams.
+    fn thinking_label(&self, elapsed_secs: u64) -> Option<String> {
+        if self.recovered.is_some()
+            || !matches!(
+                self.phase,
+                TurnPhase::Thinking | TurnPhase::Tool | TurnPhase::AssistantText
+            )
+        {
+            return None;
+        }
+        let tokens = self.tokens();
+        let suffix = if tokens.is_empty() {
+            String::new()
+        } else {
+            format!(" {tokens}")
+        };
+        Some(format!(
+            "Thinking ({}){suffix}",
+            format_elapsed(elapsed_secs)
+        ))
+    }
+
+    /// A recovered flash overrides everything else until it expires.
     pub fn label(&self, elapsed_secs: u64) -> Option<String> {
         if let Some(r) = &self.recovered {
             return Some(format!("Recovered · attempt {}/{}", r.attempt, r.limit));
         }
         match self.phase {
-            TurnPhase::Thinking => {
-                let tokens = self.tokens();
-                let suffix = if tokens.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {tokens}")
-                };
-                Some(format!(
-                    "Thinking ({}){suffix}",
-                    format_elapsed(elapsed_secs)
-                ))
+            TurnPhase::Thinking | TurnPhase::Tool | TurnPhase::AssistantText => {
+                self.thinking_label(elapsed_secs)
             }
             TurnPhase::Retrying => {
                 let r = self.retry.as_ref()?;
@@ -164,11 +166,6 @@ impl Turn {
                     )
                 })
             }
-            TurnPhase::Tool => None,
-            TurnPhase::AssistantText => {
-                let tokens = self.tokens();
-                (!tokens.is_empty()).then_some(tokens)
-            }
         }
     }
 }
@@ -177,44 +174,39 @@ pub struct StatusData {
     /// `None` when no provider is signed in — nothing to show as "the"
     /// model, since none was actually chosen by the user.
     pub model: Option<String>,
-    pub effort: Option<String>,
-    pub session_name: Option<String>,
-    /// Context used, as a percent. Hidden until it rounds to at least 1.
-    pub context_percent: Option<u8>,
-    pub queued: usize,
+    /// Estimated tokens of the current context and the model's window,
+    /// for the trailing `N%` segment.
+    pub context_used: u64,
+    pub context_total: Option<u64>,
 }
 
-/// The bottom row: blank spacer, then dot-joined segments; the leading one
-/// brighter. A transient overlay (armed-exit, menu hints) replaces the right
-/// or the whole row.
+/// The bottom row: just the model (accent-bright) and the context percent
+/// (muted) — everything else lives in the transcript or the activity row.
+/// With no panel open a blank spacer rides above; an open panel's own
+/// divider sits directly above the row instead. A transient overlay
+/// (armed-exit) rides right-aligned; a menu hint replaces the row in dim.
 pub fn statusline(
     theme: &Theme,
     data: &StatusData,
     overlay: Option<&str>,
     hint: Option<&str>,
+    panel_open: bool,
     width: usize,
 ) -> Vec<String> {
+    let lead: &[String] = if panel_open { &[] } else { &[String::new()] };
     if let Some(hint) = hint {
-        return vec![String::new(), theme.fg("muted", hint)];
+        let mut rows = lead.to_vec();
+        rows.push(theme.fg("dim", hint));
+        return rows;
     }
     let mut segments = Vec::new();
-    if data.queued > 0 {
-        segments.push(format!("queued {}", data.queued));
-    }
     if let Some(model) = &data.model {
         segments.push(compact_model_label(model));
-        if let Some(e) = &data.effort {
-            if e != "off" {
-                segments.push(e.clone());
-            }
-        }
     }
-    if let Some(n) = &data.session_name {
-        segments.push(n.clone());
-    }
-    if let Some(p) = data.context_percent {
-        if p >= 1 {
-            segments.push(format!("{p}%"));
+    if let Some(total) = data.context_total.filter(|t| *t > 0) {
+        let percent = (data.context_used * 100) / total;
+        if percent >= 1 {
+            segments.push(format!("{percent}%"));
         }
     }
 
@@ -235,12 +227,42 @@ pub fn statusline(
             line = theme.fg("muted", overlay);
         }
     }
-    vec![String::new(), line]
+    let mut rows = lead.to_vec();
+    rows.push(line);
+    rows
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, RecoveredStatus, RetryStatus, Turn, TurnPhase};
+    use super::{
+        format_elapsed, statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase,
+    };
+
+    #[test]
+    fn statusline_is_just_the_model_and_percent() {
+        let theme = crate::tui::theme::resolve("dark", false);
+        let data = StatusData {
+            model: Some("zai/glm-5.3-flash".into()),
+            context_used: 6_000,
+            context_total: Some(200_000),
+        };
+        let rows = statusline(&theme, &data, None, None, false, 120);
+        let line = rows.last().unwrap();
+        // The model leads in the accent; the percent trails muted; nothing
+        // else rides the row.
+        assert!(line.contains("glm-5.3-flash"), "{line:?}");
+        assert!(line.contains("3%"), "{line:?}");
+        assert!(
+            line.starts_with(&theme.fg_prefix("accent").to_string()),
+            "{line:?}"
+        );
+        for gone in ["Context:", "enter queue", "queued", "/", "("] {
+            assert!(
+                !line.contains(gone),
+                "segment {gone:?} should be gone: {line:?}"
+            );
+        }
+    }
     use crate::core::providers::FailureCause;
 
     #[test]
@@ -249,12 +271,16 @@ mod tests {
         assert_eq!(turn.label(0).as_deref(), Some("Thinking (0s)"));
 
         turn.phase = TurnPhase::Tool;
-        assert_eq!(turn.label(1), None, "the focused group owns tool activity");
+        // The reference keeps the Thinking clock ticking below the
+        // transient tool row.
+        assert_eq!(turn.label(1).as_deref(), Some("Thinking (1s)"));
 
         turn.input = 1_000;
         turn.output = 20;
+        // The row persists through reply streaming too — it never vanishes
+        // mid-turn.
         turn.phase = TurnPhase::AssistantText;
-        assert_eq!(turn.label(2).as_deref(), Some("(↑1k ↓20)"));
+        assert_eq!(turn.label(2).as_deref(), Some("Thinking (2s) (↑1k ↓20)"));
 
         turn.phase = TurnPhase::Thinking;
         assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1k ↓20)"));
@@ -262,10 +288,12 @@ mod tests {
 
     #[test]
     fn elapsed_switches_to_minutes_above_a_minute() {
+        // The reference grammar: no separators, no zero padding.
         assert_eq!(format_elapsed(59), "59s");
-        assert_eq!(format_elapsed(60), "1m 00s");
-        assert_eq!(format_elapsed(636), "10m 36s");
-        assert_eq!(format_elapsed(3_725), "1h 02m");
+        assert_eq!(format_elapsed(60), "1m0s");
+        assert_eq!(format_elapsed(636), "10m36s");
+        assert_eq!(format_elapsed(1_080), "18m0s");
+        assert_eq!(format_elapsed(3_663), "1h1m3s");
     }
 
     #[test]
@@ -273,9 +301,11 @@ mod tests {
         let mut turn = Turn::new();
         turn.input = 39_000;
         turn.output = 20_000;
+        // The reference compacts counts past a thousand — `↓9.6k` on the
+        // live client — while small counts stay raw.
         assert_eq!(
             turn.label(636).as_deref(),
-            Some("Thinking (10m 36s) (↑39k ↓20k)")
+            Some("Thinking (10m36s) (↑39k ↓20k)")
         );
     }
 
@@ -286,15 +316,6 @@ mod tests {
         assert_eq!(turn.tokens(), "");
         turn.note_usage(9_000, 800);
         assert_eq!(turn.tokens(), "(↑9k ↓800)");
-    }
-
-    #[test]
-    fn seeded_input_is_visibly_an_estimate() {
-        let mut turn = Turn::new();
-        turn.seed_input(5_208_000);
-        assert_eq!(turn.tokens(), "(↑~5208k ↓0)");
-        turn.note_usage(10_000, 2);
-        assert_eq!(turn.tokens(), "(↑10k ↓2)");
     }
 
     #[test]

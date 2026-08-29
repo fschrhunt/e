@@ -350,6 +350,108 @@ async fn a_blank_successful_stream_surfaces_an_error_not_silence() {
     assert!(saw_error, "a second blank success must surface an error");
 }
 
+/// A zero attempt budget means the unavoidable initial request is the only
+/// request: neither ordinary failures nor blank successes get a follow-up.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_attempt_budget_disables_every_retry_path() {
+    let _lock = env_lock();
+    let fail = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    let blank = concat!(
+        "data: {\"choices\":[{\"delta\":{}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (failure_port, failure_server) = serve_raw(vec![fail.into()]);
+    let (blank_port, blank_server) = serve_sse(&[blank]);
+    let home = mock_home();
+    home.write("settings.json", r#"{"retry_max_attempts":0}"#);
+
+    for port in [failure_port, blank_port] {
+        let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
+        agent.submit("hi".into(), "sys".into());
+        let mut retries = 0;
+        let mut error = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                SessionEvent::Retry { .. } => retries += 1,
+                SessionEvent::Error(message) => error = Some(message),
+                SessionEvent::TurnEnd { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(retries, 0, "zero budget must not emit a retry");
+        let error = error.expect("the initial failure must still be surfaced");
+        assert!(
+            !error.contains("/0 attempts"),
+            "invalid attempt count: {error}"
+        );
+    }
+
+    assert_eq!(failure_server.join().unwrap().len(), 1);
+    assert_eq!(blank_server.join().unwrap().len(), 1);
+}
+
+/// The queued-prompt review pauses the queue: a paused turn neither steers
+/// pending prompts nor ends while any remain — it holds open until the
+/// review commits its edits and releases, then delivers what the review
+/// left in the queue (not what was originally typed).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn paused_queue_holds_the_turn_open_for_review_edits() {
+    let _lock = env_lock();
+    let reply = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (port, _server) = serve_sse(&[reply, reply]);
+    let _home = mock_home();
+
+    let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
+    assert!(agent.pause_queue().is_empty());
+    agent.submit("hi".into(), "sys".into());
+    agent.submit("second".into(), "sys".into());
+    assert_eq!(agent.pause_queue(), vec!["second".to_string()]);
+
+    // While the review holds the queue the turn must not end and the
+    // queued prompt must not steer.
+    let deadline = tokio::time::sleep(Duration::from_millis(600));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            Some(event) = rx.recv() => {
+                assert!(
+                    !matches!(event, SessionEvent::TurnEnd { .. }),
+                    "turn ended while the queue was paused"
+                );
+                assert!(
+                    !matches!(event, SessionEvent::Steered(_)),
+                    "a paused queue must not steer"
+                );
+            }
+        }
+    }
+
+    // The review commits an edit and releases: the edited prompt steers,
+    // the original never does, and the turn ends.
+    agent.set_queued(vec!["edited".into()]);
+    agent.resume_queue();
+    let mut steered = Vec::new();
+    let mut ended = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            SessionEvent::Steered(text) => steered.push(text),
+            SessionEvent::TurnEnd { .. } => {
+                ended = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(ended, "the released queue lets the turn finish");
+    assert_eq!(steered, vec!["edited".to_string()]);
+}
+
 /// Gemini sends thought text only as ReasoningDelta — never a committed
 /// ReasoningItem — so a thinking-only stream that ends without text (here
 /// MAX_TOKENS mid-thought) is a live model being truncated, not a blank
