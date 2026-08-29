@@ -50,7 +50,6 @@ impl App {
                 self.end_thinking_burst();
                 if let Some(s) = &mut self.active {
                     s.turn.phase = TurnPhase::AssistantText;
-                    s.turn.note_text(&delta);
                     // Model output is untrusted: strip control sequences
                     // before it can reach the paint stream. (The raw text
                     // still goes to the model's own history in core.)
@@ -71,7 +70,6 @@ impl App {
             // assistant text.
             SessionEvent::ReasoningDelta(delta) => {
                 if let Some(s) = &mut self.active {
-                    s.turn.note_text(&delta);
                     if self.show_thinking {
                         if s.thinking_block.is_none() {
                             s.thinking_started = Some(Instant::now());
@@ -88,15 +86,13 @@ impl App {
                     }
                 }
             }
-            SessionEvent::ToolCallAssembly { bytes } => {
+            SessionEvent::ToolCallAssembly { bytes: _ } => {
                 // The model is streaming tool-call arguments. No phase of
                 // its own — the footer stays on Thinking (the model is
-                // still generating), the bytes count toward the token
-                // estimate, and the tool row appears in the tree when the
-                // call actually starts.
-                if let Some(s) = &mut self.active {
-                    s.turn.note_assembly(bytes);
-                }
+                // still generating), and the tool row appears in the tree
+                // when the call actually starts. Argument bytes are real
+                // output but are never estimated into the token display:
+                // usage frames own the numbers.
             }
             SessionEvent::ToolBatchStart { calls } => {
                 // The pre-batch reasoning collapses where it sits; the tree
@@ -233,9 +229,6 @@ impl App {
                         reason,
                     });
                     s.turn.recovered = None;
-                    // The abandoned attempt's argument bytes die with it —
-                    // the fresh attempt streams from scratch.
-                    s.turn.note_assembly(0);
                 }
                 // The abandoned attempt's thinking collapses with its
                 // duration; the retry streams a fresh burst.

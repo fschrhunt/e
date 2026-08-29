@@ -306,7 +306,10 @@ pub async fn run(
                     let cause = match value["response"]["error"]["code"].as_str().unwrap_or("") {
                         "rate_limit_exceeded" => FailureCause::RateLimited,
                         "server_error" | "internal_error" => FailureCause::ProviderUnavailable,
-                        _ => FailureCause::Rejected,
+                        // Same rule as the Anthropic dialect: an unknown
+                        // code is classified by the message's own wording.
+                        _ => crate::core::providers::classify_text(&message)
+                            .unwrap_or(FailureCause::Rejected),
                     };
                     return Err(ProviderError::frame(message, cause));
                 }

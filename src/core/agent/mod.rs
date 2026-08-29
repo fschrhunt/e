@@ -735,8 +735,9 @@ impl Agent {
                 };
 
                 // Total provider requests made for this step, including the
-                // initial request. MAX_ATTEMPTS is a request budget, not a
-                // retry budget.
+                // initial request. The budget is a request budget, not a
+                // retry budget, and is file-backed (`retry_max_attempts`).
+                let max_attempts = retry::max_attempts();
                 let mut attempt = 1u32;
                 // When this attempt's stream opened. A sleep gap whose wake
                 // came after this instant happened with the attempt in
@@ -812,7 +813,7 @@ impl Agent {
                         let _ = events
                             .send(SessionEvent::Recovered {
                                 attempt,
-                                limit: retry::MAX_ATTEMPTS,
+                                limit: max_attempts,
                             })
                             .await;
                     }
@@ -904,7 +905,7 @@ impl Agent {
                             // duplicate.
                             if err.cause.is_retryable()
                                 && nothing_produced
-                                && attempt < retry::MAX_ATTEMPTS
+                                && attempt < max_attempts
                             {
                                 let retry_number = attempt;
                                 attempt += 1;
@@ -912,7 +913,7 @@ impl Agent {
                                 let _ = events
                                     .send(SessionEvent::Retry {
                                         attempt,
-                                        limit: retry::MAX_ATTEMPTS,
+                                        limit: max_attempts,
                                         delay_secs: delay.as_secs(),
                                         cause: err.cause,
                                         reason: err.short.clone(),
@@ -981,7 +982,7 @@ impl Agent {
                                 format!(
                                     "{} — gave up after {attempt}/{} attempts: {}",
                                     err.cause.label(),
-                                    retry::MAX_ATTEMPTS,
+                                    max_attempts,
                                     err.message
                                 )
                             } else {
@@ -1068,8 +1069,16 @@ impl Agent {
                             )
                         };
                         let unrun = calls.clone();
-                        log.commit_async(ChatMessage::assistant(std::mem::take(&mut text), calls))
-                            .await;
+                        let mut final_message =
+                            ChatMessage::assistant(std::mem::take(&mut text), calls);
+                        if let Some((input, output, cache_read)) = step_usage {
+                            final_message = final_message.with_usage(providers::MessageUsage {
+                                input,
+                                output,
+                                cache_read,
+                            });
+                        }
+                        log.commit_async(final_message).await;
                         for call in unrun {
                             log.commit_async(ChatMessage::tool_result_with_meta(
                                 call.id, note, outcome, summary,
@@ -1124,7 +1133,7 @@ impl Agent {
                         let _ = events
                             .send(SessionEvent::Retry {
                                 attempt: 2,
-                                limit: retry::MAX_ATTEMPTS,
+                                limit: max_attempts,
                                 delay_secs: 1,
                                 cause: FailureCause::ProviderUnavailable,
                                 reason: "empty response".into(),
@@ -1148,9 +1157,18 @@ impl Agent {
                 for item in reasoning_items.drain(..) {
                     log.commit_async(ChatMessage::reasoning(item)).await;
                 }
-                // Commit the assistant turn (text + any calls).
-                log.commit_async(ChatMessage::assistant(text, calls.clone()))
-                    .await;
+                // Commit the assistant turn (text + any calls), with the
+                // step's real usage attached when the stream reported it —
+                // the session file then carries the token accounting.
+                let mut final_message = ChatMessage::assistant(text, calls.clone());
+                if let Some((input, output, cache_read)) = step_usage {
+                    final_message = final_message.with_usage(providers::MessageUsage {
+                        input,
+                        output,
+                        cache_read,
+                    });
+                }
+                log.commit_async(final_message).await;
 
                 if calls.is_empty() {
                     // A plain reply would end the turn — but a message that

@@ -360,7 +360,11 @@ pub async fn run(
                         "overloaded_error" | "api_error" => FailureCause::ProviderUnavailable,
                         "rate_limit_error" => FailureCause::RateLimited,
                         "authentication_error" | "permission_error" => FailureCause::Auth,
-                        _ => FailureCause::Rejected,
+                        // An unrecognized type is still classified by its
+                        // own wording — a quota wall must not look
+                        // retryable just because its type name is new.
+                        _ => crate::core::providers::classify_text(&message)
+                            .unwrap_or(FailureCause::Rejected),
                     };
                     return Err(ProviderError::frame(message, cause));
                 }

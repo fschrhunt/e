@@ -1586,7 +1586,7 @@ pub async fn run(
         auth: None,
         settings: None,
         show_thinking: crate::core::config::settings::get_string("show_thinking").as_deref()
-            == Some("on"),
+            != Some("off"),
         jobs: jobs_tx,
         logins: logins_tx,
         login_task: None,
@@ -1819,7 +1819,7 @@ pub async fn run(
                                 "show_thinking",
                             )
                             .as_deref()
-                            == Some("on");
+                            != Some("off");
                             app.refresh_status_cache();
                         } else if let Some(stage) = &mut app.auth {
                             match (&mut *stage, k.code) {
