@@ -704,6 +704,44 @@ fn picker_band_shrinks_with_its_rows() {
 }
 
 #[test]
+fn trust_panel_offers_the_broader_ancestor_between_its_rows() {
+    use e::tui::trustpanel::{render, TrustStage};
+    let theme = e::tui::theme::resolve("dark", false);
+    let mut stage = TrustStage {
+        selected: 0,
+        parent: Some(std::path::PathBuf::from("/home/u/code")),
+    };
+    let rows = render(&stage, &theme, 100, "/home/u/code/clones/e-1");
+    // Three choices: this directory, the ancestor, decline — descriptions
+    // three spaces past the longest label, not flung across the frame.
+    assert!(
+        rows[4].contains("Trust this directory   remembered"),
+        "{:?}",
+        rows[4]
+    );
+    assert!(rows[5].contains("Trust /home/u/code"), "{:?}", rows[5]);
+    assert!(rows[5].contains("everything inside it"), "{:?}", rows[5]);
+    assert!(rows[6].contains("Not now"), "{:?}", rows[6]);
+    // Selection cycles through all three and wraps.
+    stage.step(-1);
+    assert_eq!(stage.selected, 2);
+    assert_eq!(stage.choice(), (None, false), "the last row declines");
+    stage.step(-1);
+    assert_eq!(
+        stage.choice(),
+        (Some(std::path::PathBuf::from("/home/u/code")), true),
+        "the middle row trusts the ancestor"
+    );
+    // Without a parent the panel keeps its two rows.
+    let bare = TrustStage {
+        selected: 0,
+        parent: None,
+    };
+    assert_eq!(bare.row_count(), 2);
+    assert_eq!(render(&bare, &theme, 100, "/w").len(), rows.len() - 1);
+}
+
+#[test]
 fn footnotes_number_by_first_use_and_flush_dim_definitions() {
     let theme = e::tui::theme::resolve("dark", false);
     let md = "First[^b] then[^a].\n\n[^a]: alpha note\n[^b]: beta note";

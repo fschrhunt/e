@@ -26,6 +26,15 @@ release notes are that section verbatim), open a fresh empty
     spaces past the longest label) instead of a value column two-thirds
     across the frame.
 
+- The trust panel gains a middle choice: trust the broader ancestor — the
+  top-most directory under home containing the workspace (`Trust ~/code`
+  for `~/code/clones/e-1`; the immediate parent outside home). Trust now
+  propagates downward: a trusted ancestor covers every workspace inside
+  it, so sibling clones and worktrees skip their first-visit question. A
+  workspace's own recorded answer still wins over an ancestor's, and a
+  *declined* ancestor answers only for itself — its other children keep
+  their own question.
+
 - An exactness batch closing the remaining gaps against the reference
   design, each behavior verified in its source before porting:
   - Picker tabs: the skills picker gains Source tabs (All · Global ·

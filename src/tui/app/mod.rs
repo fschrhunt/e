@@ -2051,7 +2051,7 @@ pub async fn run(
         crate::core::cli::ToolMode::All => {}
     }
     if crate::core::config::trust::status(&app.agent.cwd()).is_none() {
-        app.trust = Some(TrustStage { selected: 0 });
+        app.trust = Some(TrustStage::new(&app.agent.cwd()));
     }
     // The harness pattern: check for a newer release in the background at
     // launch, install it silently, and say so — the running session is
@@ -2181,10 +2181,15 @@ pub async fn run(
                             });
                         } else if let Some(stage) = &mut app.trust {
                             match k.code {
-                                KeyCode::Up | KeyCode::Down => stage.selected = 1 - stage.selected,
+                                KeyCode::Up => stage.step(-1),
+                                KeyCode::Down => stage.step(1),
                                 KeyCode::Enter => {
-                                    let trusted = stage.selected == 0;
-                                    match crate::core::config::trust::set(&app.agent.cwd(), trusted) {
+                                    // The middle row (when offered) trusts the
+                                    // broader ancestor; trust propagates down,
+                                    // so the workspace is covered too.
+                                    let (parent, trusted) = stage.choice();
+                                    let target = parent.unwrap_or_else(|| app.agent.cwd().to_path_buf());
+                                    match crate::core::config::trust::set(&target, trusted) {
                                         Err(e) => app.notice(format!("trust: {e}")),
                                         Ok(()) => {
                                             app.trust = None;
