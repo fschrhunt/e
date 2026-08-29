@@ -8,6 +8,24 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- A preference pass — five deliberate departures from the reference where
+  its choices didn't earn their keep here:
+  - The statusline slims back to just the model (accent-bright) and the
+    context percent, muted — the extra segments (sign-in nudge, queue
+    counts, effort, session title, `Context: 12k/200k`, workspace tail and
+    git branch) are gone.
+  - The activity row wears one tone: dot, verb, elapsed, and the token
+    tail all in the accent — no dim half-color for the counts.
+  - The `• Thinking (Ns) (↑… ↓…)` row persists through the whole turn —
+    tool trees and streaming reply text included — instead of vanishing
+    whenever the phase changed.
+  - The running tool row's tree connector holds steady in the accent; the
+    activity dot below is the one blinker (a flickering `└` read as a
+    glitch).
+  - The trust panel's descriptions sit right beside their choices (three
+    spaces past the longest label) instead of a value column two-thirds
+    across the frame.
+
 - An exactness batch closing the remaining gaps against the reference
   design, each behavior verified in its source before porting:
   - Picker tabs: the skills picker gains Source tabs (All · Global ·
@@ -104,12 +122,10 @@ release notes are that section verbatim), open a fresh empty
     `● System: …`); a cancelled tool row brightens its summary and asks
     "What can e do differently?"; the welcome banner stays home on a fresh
     session only (a resumed transcript no longer re-banners).
-  - The statusline tones the whole row in the statusline gray and grows the
-    reference's segments: `run /login` when signed out, `enter queue` while
-    streaming, a 32-cell session-title cap, `Context: 12k/200k 6%`, and the
-    workspace tail with its git branch. The activity row's dot, verb, and
-    elapsed wear the accent with a dim token tail and the compact `18m0s`
-    elapsed grammar.
+  - The activity row's dot, verb, and elapsed wear the accent with the
+    compact `18m0s` elapsed grammar (the statusline later slims back to
+    the model and percent, and the token tail joins the accent — see the
+    preference pass below).
   - Inline picker selection fills the row (selection background and ink;
     the catalog menus brighten instead — see the exactness batch above),
     headers are uniformly dim, empty states use the reference's wordings,

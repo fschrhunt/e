@@ -482,13 +482,13 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     // tree row; the still-pending sibling shows nowhere yet.
     let running = group.lines_for_test(&theme, 80);
     assert_eq!(running.len(), 1, "only the header while the call runs");
-    let overlay = group.overlay_rows(&theme, 80, true);
+    let overlay = group.overlay_rows(&theme, 80);
     assert!(
         overlay[0].contains("Reading src/core/mod.rs"),
         "{overlay:?}"
     );
     assert!(!running.iter().any(|line| line.contains("cargo test")));
-    let narrow = group.overlay_rows(&theme, 20, true);
+    let narrow = group.overlay_rows(&theme, 20);
     assert!(
         narrow[0].contains('…'),
         "long targets need an explicit ellipsis"
@@ -508,7 +508,7 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     assert!(streaming[1].contains("Read src/core/mod.rs"));
     assert!(streaming[1].contains('├'), "{:?}", streaming[1]);
     assert!(!streaming.iter().any(|line| line.contains("cargo test")));
-    let overlay = group.overlay_rows(&theme, 80, true);
+    let overlay = group.overlay_rows(&theme, 80);
     assert!(overlay[0].contains("Running cargo test"));
     assert!(overlay[0].contains('└'), "a tree's focused call wears └");
     assert!(overlay.iter().any(|line| line.contains("one")));
@@ -567,7 +567,7 @@ fn running_write_and_edit_rows_stay_lean() {
     // src/lib.rs" and nothing more — no file dump. (Full content still
     // lands behind ctrl+o.)
     group.append_tool_output(1, "hello\nworld\n");
-    let overlay = group.overlay_rows(&theme, 80, true);
+    let overlay = group.overlay_rows(&theme, 80);
     assert!(overlay[0].contains("Writing src/lib.rs"), "{overlay:?}");
     assert!(overlay[0].contains('●'), "a lone call wears the ● marker");
     assert!(!overlay.iter().any(|line| line.contains('│')));
@@ -641,7 +641,7 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
         !rows.iter().any(|line| line.contains('└')),
         "the tree stays open while the focused call is out"
     );
-    let overlay = t.blocks[2].overlay_rows(&theme, 80, true);
+    let overlay = t.blocks[2].overlay_rows(&theme, 80);
     assert!(overlay[0].contains("Reading 11.rs"), "{overlay:?}");
     assert!(!rows.iter().any(|line| line.contains("earlier tool calls")));
 }

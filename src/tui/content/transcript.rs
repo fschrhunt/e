@@ -284,9 +284,10 @@ impl Block {
     }
 
     /// The transient rows for the focused running child: its status row —
-    /// `└` continuing a tree, `●` for a lone call — with the marker blinking
-    /// (accent on-phase, a bare space off), and its live output beneath.
-    pub fn overlay_rows(&self, theme: &Theme, width: usize, blink_on: bool) -> Vec<String> {
+    /// `└` continuing a tree, `●` for a lone call — with a steady accent
+    /// marker (the activity dot below is the one blinker; a flickering
+    /// tree connector reads as a glitch), and its live output beneath.
+    pub fn overlay_rows(&self, theme: &Theme, width: usize) -> Vec<String> {
         let Some(index) = self.focused_running() else {
             return Vec::new();
         };
@@ -296,11 +297,7 @@ impl Block {
         } else {
             "└"
         };
-        let marker = if blink_on {
-            theme.fg("accent", marker)
-        } else {
-            " ".to_string()
-        };
+        let marker = theme.fg("accent", marker);
         let available = width.saturating_sub(2 + display_width(&child.running));
         let target = clip_plain(&child.target, available);
         let label = if target.is_empty() {
@@ -986,10 +983,11 @@ mod tests {
     }
 
     /// The focused running call leaves the tree for the transient overlay,
-    /// whose marker blinks; the block itself stays phase-stable, so blink
-    /// ticks never invalidate its cache.
+    /// whose marker holds steady (the activity dot below is the one
+    /// blinker); the block itself stays phase-stable, so blink ticks never
+    /// invalidate its cache.
     #[test]
-    fn running_tool_paints_as_a_blinking_overlay_row() {
+    fn running_tool_paints_as_a_steady_overlay_row() {
         let theme = theme();
         let mut block = Block::tool_group(vec![ToolChild::pending(
             1,
@@ -1002,12 +1000,9 @@ mod tests {
         assert_eq!(block.focused_running(), Some(0));
         let tree = block.lines_for_test(&theme, 80);
         assert_eq!(tree.len(), 1, "the focused call has no tree row");
-        let on = block.overlay_rows(&theme, 80, true);
-        let off = block.overlay_rows(&theme, 80, false);
-        assert!(on[0].contains("Running true"), "{:?}", on[0]);
-        assert!(on[0].contains('●'), "a lone call wears the ● marker");
-        assert!(!off[0].contains('●'), "the off phase blanks the marker");
-        assert_ne!(on, off, "the overlay marker must blink");
+        let overlay = block.overlay_rows(&theme, 80);
+        assert!(overlay[0].contains("Running true"), "{:?}", overlay[0]);
+        assert!(overlay[0].contains('●'), "a lone call wears the ● marker");
         // The block's own cache is phase-stable.
         block.lines(&theme, 80, true);
         let cached = block.cache.as_ref().unwrap().2.as_ptr();
@@ -1016,7 +1011,7 @@ mod tests {
 
         block.finish_tool(1, ToolOutcome::Completed, "done".into(), "");
         assert_eq!(block.focused_running(), None);
-        assert!(block.overlay_rows(&theme, 80, true).is_empty());
+        assert!(block.overlay_rows(&theme, 80).is_empty());
     }
 
     /// Thinking streams live in thinkingText; once its burst ends, the

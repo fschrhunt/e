@@ -418,22 +418,6 @@ impl App {
     /// The workspace's current git branch, from `.git/HEAD` — a plain file
     /// read, no subprocess, absent outside a repository or on a detached
     /// HEAD. Follows one `gitdir:` indirection for worktrees.
-    fn git_branch(cwd: &std::path::Path) -> Option<String> {
-        let mut git_dir = cwd.join(".git");
-        if git_dir.is_file() {
-            let pointer = std::fs::read_to_string(&git_dir).ok()?;
-            let target = pointer.strip_prefix("gitdir:")?.trim();
-            git_dir = if std::path::Path::new(target).is_absolute() {
-                std::path::PathBuf::from(target)
-            } else {
-                cwd.join(target)
-            };
-        }
-        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-        let name = head.trim().strip_prefix("ref: refs/heads/")?;
-        (!name.is_empty()).then(|| name.to_string())
-    }
-
     fn frame(&mut self, width: usize, height: usize) -> Vec<String> {
         let blink_on = self
             .active
@@ -443,10 +427,9 @@ impl App {
         let mut lines = self
             .transcript
             .render_animated(&self.theme, width, blink_on);
-        // The reference's transient running-tool row: the focused call
-        // leaves its tree and paints directly below the transcript (no
-        // gap), its marker blinking; the activity row follows one blank
-        // further down.
+        // The transient running-tool row: the focused call leaves its tree
+        // and paints directly below the transcript (no gap), its marker
+        // steady; the activity row follows one blank further down.
         if self.active.is_some() {
             if let Some(group) = self
                 .transcript
@@ -455,7 +438,7 @@ impl App {
                 .rev()
                 .find(|b| b.kind == Kind::ToolGroup && !b.done)
             {
-                lines.extend(group.overlay_rows(&self.theme, width, blink_on));
+                lines.extend(group.overlay_rows(&self.theme, width));
             }
         }
         if let Some(s) = &self.active {
@@ -471,28 +454,23 @@ impl App {
                     // reads distinctly from ordinary thinking.
                     let dot = if blink_on { "•" } else { " " };
                     lines.push(self.theme.fg("warning", &format!("{dot} {label}")));
-                } else if matches!(s.turn.phase, TurnPhase::Thinking | TurnPhase::Tool) {
-                    // The reference runs the activity dot on the same column
-                    // as the user rail — flush left, no indent, and keeps
-                    // ticking through tool phases below the transient tool
-                    // row. The blink is presence, not color: the dot shows
-                    // and hides, no dim half-state between. Dot, verb, and
-                    // elapsed wear the accent; the token tail drops to dim.
-                    let (main, tokens) = s
-                        .turn
-                        .label_parts(s.started.elapsed().as_secs())
-                        .unwrap_or((label, String::new()));
-                    let head = if blink_on {
-                        self.theme.fg("accent", &format!("• {main}"))
+                } else if matches!(
+                    s.turn.phase,
+                    TurnPhase::Thinking | TurnPhase::Tool | TurnPhase::AssistantText
+                ) {
+                    // The activity dot runs on the same column as the user
+                    // rail — flush left, no indent — and the row persists
+                    // through every streaming phase: thinking, tool trees,
+                    // and reply text alike. The blink is presence, not
+                    // color: the dot shows and hides, no dim half-state
+                    // between. The whole label — verb, elapsed, and token
+                    // tail — wears the accent in one tone.
+                    let row = if blink_on {
+                        self.theme.fg("accent", &format!("• {label}"))
                     } else {
-                        format!("  {}", self.theme.fg("accent", &main))
+                        format!("  {}", self.theme.fg("accent", &label))
                     };
-                    let tail = if tokens.is_empty() {
-                        String::new()
-                    } else {
-                        self.theme.fg("dim", &tokens)
-                    };
-                    lines.push(format!("{head}{tail}"));
+                    lines.push(row);
                 } else {
                     lines.push(label);
                 }
@@ -561,27 +539,10 @@ impl App {
         let window = self.agent.model.context_window.max(1);
         // Nothing is signed in for the current model — it's a bootstrap
         // placeholder, not something the user chose, so don't show it.
-        let signed_in = self.signed_in;
-        let cwd = self.agent.cwd().to_path_buf();
-        let workspace = {
-            let shown = cwd.to_string_lossy().into_owned();
-            match std::env::var("HOME") {
-                Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
-                    format!("~{}", &shown[home.len()..])
-                }
-                _ => shown,
-            }
-        };
         let data = StatusData {
-            model: signed_in.then(|| self.agent.model_slug()),
-            effort: signed_in.then(|| self.status_effort.clone()).flatten(),
-            session_name: self.agent.session_name(),
+            model: self.signed_in.then(|| self.agent.model_slug()),
             context_used: self.context_tokens,
             context_total: Some(window),
-            queued: self.agent.queued_count() + self.held_prompts.len(),
-            streaming: self.active.is_some(),
-            workspace: Some(workspace),
-            branch: Self::git_branch(&cwd),
         };
         let question_hint = self.question.as_ref().map(|q| q.hint());
         let hint = question_hint.as_deref().or_else(|| {

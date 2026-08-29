@@ -4,7 +4,6 @@ use crate::core::output::{compact_model_label, format_tokens};
 use crate::core::providers::FailureCause;
 use crate::tui::markdown::visible_width;
 use crate::tui::theme::Theme;
-use unicode_width::UnicodeWidthChar;
 
 /// How long a "recovered" flash stays up before reverting to normal turn
 /// activity — matches the reference client's brief, self-clearing confirm.
@@ -152,12 +151,15 @@ impl Turn {
         }
     }
 
-    /// The Thinking label split at the token suffix, so the paint layer can
-    /// tone the verb and the `(↑… ↓…)` tail separately the reference way.
-    /// The clock keeps ticking through tool phases — the reference's `•
-    /// Thinking (Ns)` row runs below the transient tool row.
-    pub fn label_parts(&self, elapsed_secs: u64) -> Option<(String, String)> {
-        if self.recovered.is_some() || !matches!(self.phase, TurnPhase::Thinking | TurnPhase::Tool)
+    /// The `Thinking (Ns) (↑… ↓…)` activity label. The clock keeps ticking
+    /// through tool and assistant-text phases alike, so the row never
+    /// vanishes mid-turn while a tree grows or a reply streams.
+    fn thinking_label(&self, elapsed_secs: u64) -> Option<String> {
+        if self.recovered.is_some()
+            || !matches!(
+                self.phase,
+                TurnPhase::Thinking | TurnPhase::Tool | TurnPhase::AssistantText
+            )
         {
             return None;
         }
@@ -167,23 +169,20 @@ impl Turn {
         } else {
             format!(" {tokens}")
         };
-        Some((
-            format!("Thinking ({})", format_elapsed(elapsed_secs)),
-            suffix,
+        Some(format!(
+            "Thinking ({}){suffix}",
+            format_elapsed(elapsed_secs)
         ))
     }
 
-    /// The tool phase renders inside its transcript group, not in a duplicate
-    /// footer row. Assistant text needs only markerless token progress. A
-    /// recovered flash overrides everything else until it expires.
+    /// A recovered flash overrides everything else until it expires.
     pub fn label(&self, elapsed_secs: u64) -> Option<String> {
         if let Some(r) = &self.recovered {
             return Some(format!("Recovered · attempt {}/{}", r.attempt, r.limit));
         }
         match self.phase {
-            TurnPhase::Thinking | TurnPhase::Tool => {
-                let (main, suffix) = self.label_parts(elapsed_secs)?;
-                Some(format!("{main}{suffix}"))
+            TurnPhase::Thinking | TurnPhase::Tool | TurnPhase::AssistantText => {
+                self.thinking_label(elapsed_secs)
             }
             TurnPhase::Retrying => {
                 let r = self.retry.as_ref()?;
@@ -207,10 +206,6 @@ impl Turn {
                     )
                 })
             }
-            TurnPhase::AssistantText => {
-                let tokens = self.tokens();
-                (!tokens.is_empty()).then_some(tokens)
-            }
         }
     }
 }
@@ -219,85 +214,17 @@ pub struct StatusData {
     /// `None` when no provider is signed in — nothing to show as "the"
     /// model, since none was actually chosen by the user.
     pub model: Option<String>,
-    pub effort: Option<String>,
-    pub session_name: Option<String>,
-    /// Estimated tokens of the current context and the model's window, for
-    /// the reference's `Context: 12k/200k 6%` segment.
+    /// Estimated tokens of the current context and the model's window,
+    /// for the trailing `N%` segment.
     pub context_used: u64,
     pub context_total: Option<u64>,
-    pub queued: usize,
-    /// A turn is streaming — the reference says `enter queue`.
-    pub streaming: bool,
-    /// The workspace tail (`~`-relative) and git branch for the trailing
-    /// identity segment.
-    pub workspace: Option<String>,
-    pub branch: Option<String>,
 }
 
-/// The reference caps the session title at 32 cells.
-const MAX_SESSION_TITLE_CELLS: usize = 32;
-
-fn prefix_by_cells(text: &str, cells: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if used + w > cells {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
-}
-
-fn suffix_by_cells(text: &str, cells: usize) -> String {
-    let total: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
-    if total <= cells {
-        return text.to_string();
-    }
-    let mut skip = total.saturating_sub(cells);
-    let mut out = String::new();
-    for c in text.chars() {
-        let w = c.width().unwrap_or(0);
-        if skip > 0 {
-            skip = skip.saturating_sub(w);
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// The trailing `path (branch)` identity, budgeted the reference way: the
-/// branch appears only when at least seven cells are free, takes at most
-/// half the budget (floor four), and each side clips toward what matters —
-/// the path keeps its tail, the branch its head.
-fn workspace_identity(workspace: &str, branch: Option<&str>, budget: usize) -> Option<String> {
-    if workspace.is_empty() || budget == 0 {
-        return None;
-    }
-    if let Some(branch) = branch.filter(|b| !b.is_empty()) {
-        if budget >= 7 {
-            let branch_width: usize = branch.chars().map(|c| c.width().unwrap_or(0)).sum();
-            let branch_budget = branch_width.min((budget - 4).min(4usize.max(budget / 2)));
-            let path_budget = budget - 3 - branch_budget;
-            return Some(format!(
-                "{} ({})",
-                suffix_by_cells(workspace, path_budget),
-                prefix_by_cells(branch, branch_budget)
-            ));
-        }
-    }
-    Some(suffix_by_cells(workspace, budget))
-}
-
-/// The bottom row: dot-joined segments in the statusline gray — the
-/// reference tones the whole row alike. With no panel open a blank spacer
-/// rides above (the reference paints its bottom-divider row blank there);
-/// an open panel's own divider sits directly above the row instead. A
-/// transient overlay (armed-exit) rides right-aligned; a menu hint replaces
-/// the row in dim.
+/// The bottom row: just the model (accent-bright) and the context percent
+/// (muted) — everything else lives in the transcript or the activity row.
+/// With no panel open a blank spacer rides above; an open panel's own
+/// divider sits directly above the row instead. A transient overlay
+/// (armed-exit) rides right-aligned; a menu hint replaces the row in dim.
 pub fn statusline(
     theme: &Theme,
     data: &StatusData,
@@ -313,58 +240,23 @@ pub fn statusline(
         return rows;
     }
     let mut segments = Vec::new();
-    if data.model.is_none() {
-        segments.push("run /login".to_string());
-    }
-    if data.queued > 0 {
-        segments.push(format!("queued {}", data.queued));
-    }
-    if data.streaming {
-        segments.push("enter queue".to_string());
-    }
     if let Some(model) = &data.model {
         segments.push(compact_model_label(model));
-        if let Some(e) = &data.effort {
-            if e != "off" {
-                segments.push(e.clone());
-            }
-        }
     }
-    if let Some(n) = &data.session_name {
-        segments.push(prefix_by_cells(n, MAX_SESSION_TITLE_CELLS));
-    }
-    if data.context_used > 0 {
-        segments.push(match data.context_total {
-            Some(total) if total > 0 => format!(
-                "Context: {}k/{}k {}%",
-                data.context_used / 1000,
-                total / 1000,
-                (data.context_used * 100) / total
-            ),
-            _ => format!("Context: {}k", data.context_used / 1000),
-        });
-    }
-    let mut line_plain = segments.join(" · ");
-    if let Some(workspace) = &data.workspace {
-        let used: usize = line_plain.chars().map(|c| c.width().unwrap_or(0)).sum();
-        let sep = if line_plain.is_empty() { 0 } else { 3 };
-        if used + sep < width {
-            if let Some(identity) =
-                workspace_identity(workspace, data.branch.as_deref(), width - used - sep)
-            {
-                if !line_plain.is_empty() {
-                    line_plain.push_str(" · ");
-                }
-                line_plain.push_str(&identity);
-            }
+    if let Some(total) = data.context_total.filter(|t| *t > 0) {
+        let percent = (data.context_used * 100) / total;
+        if percent >= 1 {
+            segments.push(format!("{percent}%"));
         }
     }
 
-    let mut line = if line_plain.is_empty() {
-        String::new()
-    } else {
-        theme.fg("muted", &line_plain)
-    };
+    let mut line = String::new();
+    if let Some((head, rest)) = segments.split_first() {
+        line = theme.fg("accent", head);
+        if !rest.is_empty() {
+            line.push_str(&theme.fg("muted", &format!(" · {}", rest.join(" · "))));
+        }
+    }
     if let Some(overlay) = overlay {
         let used = visible_width(&line);
         let pad = width.saturating_sub(used + overlay.chars().count());
@@ -382,7 +274,35 @@ pub fn statusline(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_elapsed, RecoveredStatus, RetryStatus, Turn, TurnPhase};
+    use super::{
+        format_elapsed, statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase,
+    };
+
+    #[test]
+    fn statusline_is_just_the_model_and_percent() {
+        let theme = crate::tui::theme::resolve("dark", false);
+        let data = StatusData {
+            model: Some("zai/glm-5.3-flash".into()),
+            context_used: 6_000,
+            context_total: Some(200_000),
+        };
+        let rows = statusline(&theme, &data, None, None, false, 120);
+        let line = rows.last().unwrap();
+        // The model leads in the accent; the percent trails muted; nothing
+        // else rides the row.
+        assert!(line.contains("glm-5.3-flash"), "{line:?}");
+        assert!(line.contains("3%"), "{line:?}");
+        assert!(
+            line.starts_with(&theme.fg_prefix("accent").to_string()),
+            "{line:?}"
+        );
+        for gone in ["Context:", "enter queue", "queued", "/", "("] {
+            assert!(
+                !line.contains(gone),
+                "segment {gone:?} should be gone: {line:?}"
+            );
+        }
+    }
     use crate::core::providers::FailureCause;
 
     #[test]
@@ -397,8 +317,10 @@ mod tests {
 
         turn.input = 1_000;
         turn.output = 20;
+        // The row persists through reply streaming too — it never vanishes
+        // mid-turn.
         turn.phase = TurnPhase::AssistantText;
-        assert_eq!(turn.label(2).as_deref(), Some("(↑1k ↓20)"));
+        assert_eq!(turn.label(2).as_deref(), Some("Thinking (2s) (↑1k ↓20)"));
 
         turn.phase = TurnPhase::Thinking;
         assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1k ↓20)"));
