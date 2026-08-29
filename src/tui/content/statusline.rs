@@ -1,6 +1,6 @@
 //! Activity row and status line — pure projections of app state.
 
-use crate::core::output::compact_model_label;
+use crate::core::output::{compact_model_label, format_tokens};
 use crate::core::providers::FailureCause;
 use crate::tui::markdown::visible_width;
 use crate::tui::theme::Theme;
@@ -140,11 +140,15 @@ impl Turn {
         if self.input == 0 && output == 0 {
             String::new()
         } else {
-            // The reference prints raw counts — `(↑10 ↓20)` — never a
-            // compacted `1k`. The `~` marks a chars/4 seed the reference
-            // doesn't have; it clears once real usage lands.
+            // The reference compacts past a thousand — `(↑31 ↓9.6k)`. The
+            // `~` marks a chars/4 seed the reference doesn't have; it
+            // clears once real usage lands.
             let estimate = if self.input_estimated { "~" } else { "" };
-            format!("(↑{estimate}{} ↓{output})", self.input)
+            format!(
+                "(↑{estimate}{} ↓{})",
+                format_tokens(self.input),
+                format_tokens(output)
+            )
         }
     }
 
@@ -390,10 +394,10 @@ mod tests {
         turn.input = 1_000;
         turn.output = 20;
         turn.phase = TurnPhase::AssistantText;
-        assert_eq!(turn.label(2).as_deref(), Some("(↑1000 ↓20)"));
+        assert_eq!(turn.label(2).as_deref(), Some("(↑1k ↓20)"));
 
         turn.phase = TurnPhase::Thinking;
-        assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1000 ↓20)"));
+        assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1k ↓20)"));
     }
 
     #[test]
@@ -411,10 +415,11 @@ mod tests {
         let mut turn = Turn::new();
         turn.input = 39_000;
         turn.output = 20_000;
-        // The reference prints raw token counts, never a compacted `39k`.
+        // The reference compacts counts past a thousand — `↓9.6k` on the
+        // live client — while small counts stay raw.
         assert_eq!(
             turn.label(636).as_deref(),
-            Some("Thinking (10m36s) (↑39000 ↓20000)")
+            Some("Thinking (10m36s) (↑39k ↓20k)")
         );
     }
 
@@ -425,35 +430,35 @@ mod tests {
         turn.note_assembly(8_000); // ~2k tokens of argument JSON so far
         assert_eq!(
             turn.label(7).as_deref(),
-            Some("Thinking (7s) (↑50000 ↓2200)"),
+            Some("Thinking (7s) (↑50k ↓2.2k)"),
             "argument streaming stays in the Thinking phase — the tool row, not the footer, owns the activity"
         );
         // The next cumulative report ticks the same counter.
         turn.note_assembly(12_000);
-        assert_eq!(turn.tokens(), "(↑50000 ↓3200)");
+        assert_eq!(turn.tokens(), "(↑50k ↓3.2k)");
     }
 
     #[test]
     fn usage_resets_the_streaming_estimate() {
         let mut turn = Turn::new();
         turn.note_text(&"x".repeat(4_000)); // ~1k estimated
-        assert_eq!(turn.tokens(), "(↑0 ↓1000)");
+        assert_eq!(turn.tokens(), "(↑0 ↓1k)");
         // Real usage lands: the estimate must not double what is now
         // counted for real.
         turn.note_usage(9_000, 800);
-        assert_eq!(turn.tokens(), "(↑9000 ↓800)");
+        assert_eq!(turn.tokens(), "(↑9k ↓800)");
         // The next step's streaming adds on top of the real total.
         turn.note_text("abcd");
-        assert_eq!(turn.tokens(), "(↑9000 ↓801)");
+        assert_eq!(turn.tokens(), "(↑9k ↓801)");
     }
 
     #[test]
     fn seeded_input_is_visibly_an_estimate() {
         let mut turn = Turn::new();
         turn.seed_input(5_208_000);
-        assert_eq!(turn.tokens(), "(↑~5208000 ↓0)");
+        assert_eq!(turn.tokens(), "(↑~5208k ↓0)");
         turn.note_usage(10_000, 2);
-        assert_eq!(turn.tokens(), "(↑10000 ↓2)");
+        assert_eq!(turn.tokens(), "(↑10k ↓2)");
     }
 
     #[test]

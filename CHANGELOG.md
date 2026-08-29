@@ -69,9 +69,9 @@ release notes are that section verbatim), open a fresh empty
     reference's segments: `run /login` when signed out, `enter queue` while
     streaming, a 32-cell session-title cap, `Context: 12k/200k 6%`, and the
     workspace tail with its git branch. The activity row's dot, verb, and
-    elapsed wear the accent with a dim token tail, raw token counts, and the
-    compact `18m0s` elapsed grammar.
-  - The composer takes the reference's full-width top divider; picker
+    elapsed wear the accent with a dim token tail and the compact `18m0s`
+    elapsed grammar.
+  - Picker
     selection fills the row (selection background and ink) everywhere but
     the model pickers, headers are uniformly dim, empty states use the
     reference's wordings, nav hints degrade stepwise with the frame, and

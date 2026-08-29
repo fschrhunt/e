@@ -171,6 +171,17 @@ fn target_question(args: &Value) -> String {
     sanitize_inline(args["question"].as_str().unwrap_or(""))
 }
 
+/// The row-worthy reason inside a failure message: `edit x: old_string not
+/// found` → `old_string not found` — the reference's failed rows carry it
+/// (`Failed path: preflight failed`). A message with no colon rides whole.
+pub(crate) fn failure_summary(message: &str) -> String {
+    message
+        .split_once(": ")
+        .map(|(_, reason)| reason)
+        .unwrap_or(message)
+        .to_string()
+}
+
 fn ask_schema() -> Value {
     schema_object(
         "ask",

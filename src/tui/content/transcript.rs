@@ -453,9 +453,22 @@ impl Block {
                     } else {
                         String::new()
                     };
+                    // The reference's failed rows name the reason: `Failed
+                    // path: preflight failed`. A generic "error" summary
+                    // adds nothing and stays off the row.
+                    let target_plain = match (&child.state, child.result.as_deref()) {
+                        (ToolState::Failed, Some(reason))
+                            if child.category != "command"
+                                && !reason.is_empty()
+                                && reason != "error" =>
+                        {
+                            format!("{}: {reason}", child.target)
+                        }
+                        _ => child.target.clone(),
+                    };
                     let suffix_width: usize = suffix_stat_width(&suffix);
                     let available = width.saturating_sub(2 + display_width(action) + suffix_width);
-                    let target = clip_plain(&child.target, available);
+                    let target = clip_plain(&target_plain, available);
                     let label = if target.is_empty() {
                         action.to_string()
                     } else {

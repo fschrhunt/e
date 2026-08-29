@@ -20,9 +20,9 @@ pub fn schema() -> Value {
 
 pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
     let err = |m: String| ToolOutput {
+        summary: super::failure_summary(&m),
         content: m,
         outcome: ToolOutcome::Failed,
-        summary: "error".into(),
         display: None,
     };
     let Some(path) = args["path"].as_str() else {

@@ -16,9 +16,9 @@ fn ok(content: String, summary: String) -> ToolOutput {
 }
 fn err(message: String) -> ToolOutput {
     ToolOutput {
+        summary: super::failure_summary(&message),
         content: message,
         outcome: ToolOutcome::Failed,
-        summary: "error".into(),
         display: None,
     }
 }
