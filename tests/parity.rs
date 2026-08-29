@@ -791,6 +791,20 @@ fn footnote_lists_and_code_stay_in_the_definition_body() {
 }
 
 #[test]
+fn footnote_blockquotes_and_rules_stay_in_the_definition_body() {
+    let theme = e::tui::theme::resolve("dark", false);
+    let md = "Body[^n]. After.\n\n[^n]: intro\n\n    > quoted note\n\n    ---";
+    let out = render_markdown(&theme, md, 80);
+    let flow = out.iter().position(|r| r.contains("After.")).unwrap();
+    let note = out.iter().position(|r| r.contains("intro")).unwrap();
+    let quote = out.iter().position(|r| r.contains("quoted note")).unwrap();
+    // The definition's own blocks render under the definition, never in
+    // the message flow between the body and the footer.
+    assert!(note > flow && quote > note, "{out:?}");
+    assert!(out[quote].contains('│'), "the rail rode along: {out:?}");
+}
+
+#[test]
 fn file_rows_segment_paths_the_reference_way() {
     use e::tui::menu::project_path;
     let plain = |width: usize, label: &str| -> String {
@@ -917,7 +931,42 @@ fn question_panel_frames_options_with_brightness_selection() {
     assert_eq!(q.answer(), None);
     q.freeform = "teal".into();
     assert_eq!(q.answer().as_deref(), Some("teal"));
-    assert!(q.hint().starts_with("Type answer"));
+    assert!(q.hint(80).starts_with("Type answer"));
+
+    // Hints degrade stepwise with the frame, like every picker's.
+    assert_eq!(
+        q.hint(12),
+        "Enter Answer  Esc Cancel",
+        "nothing longer fits at twelve cells"
+    );
+    q.selected = 0;
+    assert_eq!(
+        q.hint(80),
+        "1–2 Choose now    ↑↓ Options    Enter Answer    Esc Cancel"
+    );
+    assert_eq!(q.hint(40), "↑↓ Options    Enter Answer    Esc Cancel");
+
+    // The description column clears the widest label in display cells, so
+    // the wide-glyph row keeps the same three-cell gap as the narrow one.
+    let wide = Question::new(
+        8,
+        "pick".into(),
+        vec![
+            ("日本語".into(), "desc-a".into()),
+            ("ab".into(), "desc-b".into()),
+        ],
+        false,
+    );
+    let rows = wide.render(&theme, 80);
+    let col = |row: &str| {
+        let at = row.find("desc-").unwrap();
+        e::tui::markdown::visible_width(&row[..at])
+    };
+    let a = rows.iter().find(|r| r.contains("desc-a")).unwrap();
+    let b = rows.iter().find(|r| r.contains("desc-b")).unwrap();
+    // "  1) 日本語" is 2+3+6 = 11 cells; the description starts 3 past it.
+    assert_eq!(col(a), 14, "wide label clears the gap: {rows:?}");
+    assert_eq!(col(b), 14, "one shared column: {rows:?}");
 }
 
 #[test]

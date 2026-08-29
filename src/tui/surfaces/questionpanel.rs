@@ -75,18 +75,28 @@ impl Question {
         }
     }
 
-    /// The status-row hint for the current selection.
-    pub fn hint(&self) -> String {
-        if self.freeform_selected() {
-            "Type answer    ↑↓ Options    Enter Answer    Esc Cancel".to_string()
+    /// The status-row hint for the current selection, degraded to the
+    /// frame's width the way every picker hint is.
+    pub fn hint(&self, width: usize) -> String {
+        let head = if self.freeform_selected() {
+            "Type answer    ".to_string()
         } else if self.options.len() > 1 {
-            format!(
-                "1–{} Choose now    ↑↓ Options    Enter Answer    Esc Cancel",
-                self.options.len()
-            )
+            // 1–9 covers the digit grammar's whole reach.
+            format!("1–{} Choose now    ", self.options.len())
         } else {
-            "↑↓ Options    Enter Answer    Esc Cancel".to_string()
-        }
+            String::new()
+        };
+        let candidates = [
+            format!("{head}↑↓ Options    Enter Answer    Esc Cancel"),
+            "↑↓ Options    Enter Answer    Esc Cancel".to_string(),
+            "↑↓ Options  Enter Answer  Esc Cancel".to_string(),
+            "Enter Answer  Esc Cancel".to_string(),
+        ];
+        candidates
+            .iter()
+            .find(|c| c.chars().count() <= width)
+            .unwrap_or(&candidates[candidates.len() - 1])
+            .clone()
     }
 
     pub fn render(&self, theme: &Theme, width: usize) -> Vec<String> {
@@ -99,11 +109,13 @@ impl Question {
         let mut body: Vec<String> = question_rows.collect();
 
         // `  n) label` rows; the description column clears the widest label.
+        // Measured in display cells, not chars — wide glyphs must clear
+        // the description column too.
         let description_col = 2
             + self
                 .options
                 .iter()
-                .map(|(label, _)| label.chars().count() + 3)
+                .map(|(label, _)| visible_width(label) + 3)
                 .max()
                 .unwrap_or(0)
             + 3;

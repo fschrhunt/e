@@ -1302,6 +1302,7 @@ impl Agent {
                     let events = events.clone();
                     let cwd = cwd.clone();
                     let asks = asks.clone();
+                    let pending_signal = pending_signal.clone();
                     handles.push((
                         call.clone(),
                         tokio::spawn(async move {
@@ -1315,6 +1316,7 @@ impl Agent {
                                     id,
                                     events: events.clone(),
                                     asks,
+                                    pending_signal,
                                 },
                                 &call.name,
                                 &call.arguments,
@@ -1449,6 +1451,9 @@ struct ToolRunContext {
     id: u64,
     events: mpsc::Sender<SessionEvent>,
     asks: AskRegistry,
+    /// The turn loop's hold-open wakeup, shared so an ask's cancel wait is
+    /// signal-driven too — `interrupt` notifies, no polling.
+    pending_signal: Arc<tokio::sync::Notify>,
 }
 
 /// The ask tool runs here, not in the tool table: it blocks on the person
@@ -1460,6 +1465,7 @@ async fn run_ask(
     events: &mpsc::Sender<SessionEvent>,
     asks: &AskRegistry,
     cancel: &Arc<AtomicBool>,
+    pending_signal: &tokio::sync::Notify,
 ) -> tools::ToolOutput {
     let args: serde_json::Value =
         serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
@@ -1503,9 +1509,19 @@ async fn run_ask(
             allow_freeform,
         })
         .await;
-    let reply = tokio::select! {
-        answer = rx => answer.ok().flatten(),
-        _ = wait_cancelled(cancel) => None,
+    // Asleep until the answer arrives or the turn is interrupted. The
+    // notify also fires on unrelated queue changes; a wake just re-checks
+    // the latch. No polling.
+    let mut rx = rx;
+    let reply = loop {
+        tokio::select! {
+            answer = &mut rx => break answer.ok().flatten(),
+            _ = pending_signal.notified() => {
+                if cancel.load(Ordering::SeqCst) {
+                    break None;
+                }
+            }
+        }
     };
     asks.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     match reply {
@@ -1533,6 +1549,7 @@ async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools
         id,
         events,
         asks,
+        pending_signal,
     } = context;
     if !tool_mode.allows(name) {
         let mode = match tool_mode {
@@ -1625,7 +1642,7 @@ async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools
         }
     }
     if name == "ask" {
-        return run_ask(id, arguments, &events, &asks, &cancel).await;
+        return run_ask(id, arguments, &events, &asks, &cancel, &pending_signal).await;
     }
     let name = name.to_string();
     let arguments = arguments.to_string();
@@ -1700,6 +1717,7 @@ mod option_tests {
                 id: 1,
                 events,
                 asks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                pending_signal: Arc::new(tokio::sync::Notify::new()),
             },
             "bash",
             r#"{"command":"touch should-not-exist"}"#,

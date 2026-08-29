@@ -320,11 +320,14 @@ impl Block {
     /// rows carrying their stored-detail id so the screen can splice the
     /// full output beneath. The review shows every child — the focused
     /// running call included, since the screen has no overlay.
-    pub fn review_lines(&self, theme: &Theme, width: usize) -> Vec<(String, Option<u64>)> {
+    pub fn review_lines(&mut self, theme: &Theme, width: usize) -> Vec<(String, Option<u64>)> {
         if self.kind != Kind::ToolGroup || self.tool_children.is_empty() {
+            // The cached path: the projection pays only for blocks whose
+            // content actually changed, sharing the main transcript's cache.
             return self
-                .render(theme, width, false)
-                .into_iter()
+                .lines(theme, width, false)
+                .iter()
+                .cloned()
                 .map(|row| (row, None))
                 .collect();
         }

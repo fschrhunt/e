@@ -328,11 +328,12 @@ impl App {
     /// The projection itself, pure over the current transcript: the whole
     /// transcript with each child row's stored detail railed beneath it —
     /// folded to three lines behind the reference's `→ to expand` hint at
-    /// Review depth, whole at Full.
-    fn project_rows(&self, width: usize, full: bool) -> Vec<String> {
+    /// Review depth, whole at Full. Non-tool blocks render through the
+    /// per-block cache, so a rebuild pays only for blocks that changed.
+    fn project_rows(&mut self, width: usize, full: bool) -> Vec<String> {
         const REVIEW_DETAIL_LINES: usize = 3;
         let mut rows: Vec<String> = Vec::new();
-        for block in &self.transcript.blocks {
+        for block in &mut self.transcript.blocks {
             let lines = block.review_lines(&self.theme, width);
             if lines.is_empty() {
                 continue;
@@ -343,7 +344,7 @@ impl App {
             for (row, detail) in lines {
                 rows.push(crate::tui::markdown::clip_styled(&row, width));
                 let Some(id) = detail else { continue };
-                let Some(body) = self.output_body(id) else {
+                let Some(body) = Self::output_body(&self.outputs, id) else {
                     rows.push(self.theme.fg("dim", "│  Full saved result unavailable."));
                     continue;
                 };
@@ -355,7 +356,7 @@ impl App {
                 };
                 let mut clipped_any = false;
                 for line in &body_lines[..shown] {
-                    let railed = match self.diff_row_color(line) {
+                    let railed = match Self::diff_row_color(&self.theme, line) {
                         Some(colored) => {
                             format!("{} {colored}", self.theme.fg("dim", "│"))
                         }
@@ -390,12 +391,10 @@ impl App {
         };
         let body = self.viewer_rows(width, viewer.full);
         let window = height.saturating_sub(1).max(1);
-        let mut rows: Vec<String> = body
-            .iter()
-            .skip(viewer.scroll)
-            .take(window)
-            .cloned()
-            .collect();
+        // The body can shrink under a deep scroll (the output store evicts;
+        // details disappear) — clamp so the screen never renders blank.
+        let scroll = viewer.scroll.min(body.len().saturating_sub(1));
+        let mut rows: Vec<String> = body.iter().skip(scroll).take(window).cloned().collect();
         while rows.len() < window {
             rows.push(String::new());
         }
@@ -409,6 +408,11 @@ impl App {
             self.theme.fg("userMessageText", "┃"),
             self.theme.fg("muted", nav)
         ));
+        // Persist the clamp once `body`'s borrow is done, so ↑/↓ arithmetic
+        // starts from a scroll the body can actually show.
+        if let Some(viewer) = self.viewer.as_mut() {
+            viewer.scroll = scroll;
+        }
         rows
     }
 
@@ -416,9 +420,9 @@ impl App {
     /// column takes the diff-marker hue (`+` green, `-` red), context and
     /// `⋯` elision rows dim, anything else passes through untouched — the
     /// reference keeps the changed text itself neutral.
-    fn diff_row_color(&self, line: &str) -> Option<String> {
+    fn diff_row_color(theme: &Theme, line: &str) -> Option<String> {
         if line.trim() == "⋯" && line.starts_with("      ") {
-            return Some(self.theme.fg("dim", line));
+            return Some(theme.fg("dim", line));
         }
         let field = line.get(..5)?;
         let number = field.trim_start();
@@ -430,7 +434,7 @@ impl App {
         }
         let rest = &line[5..];
         if rest.is_empty() || rest.starts_with("   ") {
-            return Some(self.theme.fg("dim", line));
+            return Some(theme.fg("dim", line));
         }
         let added = if rest == " +" || rest.starts_with(" + ") {
             true
@@ -440,11 +444,7 @@ impl App {
             return None;
         };
         let token = crate::tui::theme::Theme::diff_marker_token(added);
-        Some(format!(
-            "{}{}",
-            self.theme.fg(token, &line[..7]),
-            &line[7..]
-        ))
+        Some(format!("{}{}", theme.fg(token, &line[..7]), &line[7..]))
     }
 
     fn frame(&mut self, width: usize, height: usize) -> Vec<String> {
@@ -519,7 +519,14 @@ impl App {
             let total = steering + self.held_prompts.len();
             if total > 0 && self.active.is_some() {
                 let paused = self.queue_review.is_some();
-                let affordance = if paused { "" } else { " · ↑ to edit" };
+                // Held prompts (compaction, a `!` command) can't be edited
+                // into the composer — only queued steering prompts can — so
+                // the affordance appears only when the edit target exists.
+                let affordance = if paused || steering == 0 {
+                    ""
+                } else {
+                    " · ↑ to edit"
+                };
                 let ordinary = total - steering;
                 let label = if ordinary == 0 && steering == 1 {
                     format!("1 steering message{affordance}")
@@ -573,7 +580,7 @@ impl App {
             context_used: self.context_tokens,
             context_total: Some(window),
         };
-        let question_hint = self.question.as_ref().map(|q| q.hint());
+        let question_hint = self.question.as_ref().map(|q| q.hint(width));
         let hint = question_hint.as_deref().or_else(|| {
             self.settings
                 .as_ref()
@@ -819,6 +826,10 @@ impl App {
                     }
                 );
                 item.meta = format!("{workspace} · {} · {turns}", ago(info.modified));
+                // Tab index space: 0 = current workspace, 1 = the
+                // "All workspaces" tab itself. Tagging other workspaces 1
+                // works because `tab_admits` checks all_tab before item
+                // tags — reordering these tabs breaks that silently.
                 item.tab = Some(if crate::core::session::normalized_cwd(&info.cwd) == cwd {
                     0
                 } else {
@@ -1553,8 +1564,8 @@ impl App {
         id
     }
 
-    fn output_body(&self, id: u64) -> Option<&str> {
-        self.outputs
+    fn output_body(outputs: &[(u64, String, String)], id: u64) -> Option<&str> {
+        outputs
             .iter()
             .find(|(stored, _, _)| *stored == id)
             .map(|(_, _, body)| body.as_str())
@@ -3324,6 +3335,46 @@ mod tests {
             "the new detail must appear without a width or depth change"
         );
         assert_ne!(running, reported);
+    }
+
+    #[test]
+    fn review_screen_clamps_scroll_when_the_body_shrinks() {
+        let mut app = session_app();
+        app.transcript.push(Block::new(Kind::User, "some content"));
+        app.viewer = Some(Viewer {
+            full: false,
+            scroll: 500,
+        });
+
+        let frame = app.viewer_frame(80, 24);
+
+        let body = &frame[..frame.len() - 1];
+        assert!(
+            body.iter().any(|r| r.contains("some content")),
+            "a deep scroll must clamp to the shrunken body: {frame:?}"
+        );
+        assert_eq!(
+            app.viewer.as_ref().unwrap().scroll,
+            0,
+            "the clamp persists so ↑/↓ arithmetic starts in range"
+        );
+    }
+
+    #[test]
+    fn queued_banner_offers_edit_only_for_editable_prompts() {
+        let mut app = session_app();
+        app.on_session_event(SessionEvent::TurnStart);
+        // A held prompt (compaction, a `!` command) cannot be pulled into
+        // the composer — only queued steering prompts can.
+        app.held_prompts = vec!["held".into()];
+
+        let lines = app.frame(80, 24);
+
+        let banner = lines
+            .iter()
+            .find(|l| l.contains("queued message"))
+            .expect("the banner names the held prompt");
+        assert!(!banner.contains("↑ to edit"), "{banner:?}");
     }
 
     #[test]

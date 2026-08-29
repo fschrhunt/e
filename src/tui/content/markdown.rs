@@ -648,6 +648,37 @@ fn push_text_autolinked(inline: &mut String, text: &str, link_seq: &mut u64) {
     }
 }
 
+/// A finished block joins the message flow, with the blank separator row.
+fn push_block(out: &mut Vec<String>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(String::new());
+    }
+    out.extend(lines);
+}
+
+/// A finished block inside a footnote definition joins the definition's
+/// body — the footer renders it under the `[N]` marker instead of leaking
+/// it into the message flow. Every block-emitting arm routes through here.
+fn emit_block(
+    out: &mut Vec<String>,
+    footnotes: &mut [(String, Option<usize>, String)],
+    open: Option<usize>,
+    rows: Vec<String>,
+) {
+    if let Some(index) = open {
+        let body = &mut footnotes[index].2;
+        if !body.is_empty() && !rows.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&rows.join("\n"));
+    } else {
+        push_block(out, rows);
+    }
+}
+
 /// Render a markdown document to lines at `width`, one blank row between blocks.
 pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<String> {
     let mut opts = Options::empty();
@@ -658,15 +689,6 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
     let parser = Parser::new_ext(markdown, opts);
 
     let mut out: Vec<String> = Vec::new();
-    let push_block = |out: &mut Vec<String>, lines: Vec<String>| {
-        if lines.is_empty() {
-            return;
-        }
-        if !out.is_empty() {
-            out.push(String::new());
-        }
-        out.extend(lines);
-    };
 
     // Inline accumulation state.
     let mut inline = String::new();
@@ -724,16 +746,6 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                 open_footnote = None;
                 inline.clear();
             }
-            Event::End(TagEnd::Paragraph) if open_footnote.is_some() => {
-                if let Some(index) = open_footnote {
-                    let note = &mut footnotes[index];
-                    if !note.2.is_empty() {
-                        note.2.push('\n');
-                    }
-                    note.2.push_str(&inline);
-                }
-                inline.clear();
-            }
             Event::Start(Tag::Heading { level, .. }) => {
                 heading = Some(match level {
                     HeadingLevel::H1 => 1,
@@ -752,7 +764,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                     .into_iter()
                     .map(|row| heading_style(level, &row))
                     .collect();
-                push_block(&mut out, rows);
+                emit_block(&mut out, &mut footnotes, open_footnote, rows);
                 inline.clear();
             }
             Event::Start(Tag::Paragraph) => inline.clear(),
@@ -767,7 +779,14 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                         .into_iter()
                         .map(|r| format!("{rail}{r}"))
                         .collect();
-                    push_block(&mut out, rows);
+                    emit_block(&mut out, &mut footnotes, open_footnote, rows);
+                    inline.clear();
+                } else if let Some(index) = open_footnote {
+                    let note = &mut footnotes[index];
+                    if !note.2.is_empty() {
+                        note.2.push('\n');
+                    }
+                    note.2.push_str(&inline);
                     inline.clear();
                 } else if table.is_none() {
                     push_block(&mut out, wrap_styled(&inline, width));
@@ -808,15 +827,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                 lists.pop();
                 if lists.is_empty() {
                     let lines = std::mem::take(&mut item_first_lines);
-                    if let Some(index) = open_footnote {
-                        let body = &mut footnotes[index].2;
-                        if !body.is_empty() && !lines.is_empty() {
-                            body.push('\n');
-                        }
-                        body.push_str(&lines.join("\n"));
-                    } else {
-                        push_block(&mut out, lines);
-                    }
+                    emit_block(&mut out, &mut footnotes, open_footnote, lines);
                 }
             }
             Event::Start(Tag::Item) => {
@@ -864,15 +875,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((lang, buffer)) = code.take() {
                     let lines = code_panel(theme, &buffer, &lang, width);
-                    if let Some(index) = open_footnote {
-                        let body = &mut footnotes[index].2;
-                        if !body.is_empty() && !lines.is_empty() {
-                            body.push('\n');
-                        }
-                        body.push_str(&lines.join("\n"));
-                    } else {
-                        push_block(&mut out, lines);
-                    }
+                    emit_block(&mut out, &mut footnotes, open_footnote, lines);
                 }
             }
             Event::Start(Tag::Table(aligns)) => {
@@ -907,10 +910,15 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             }
             Event::End(TagEnd::Table) => {
                 if let Some((header, rows, aligns, _)) = table.take() {
-                    push_block(&mut out, render_table(&header, &rows, &aligns, width));
+                    emit_block(
+                        &mut out,
+                        &mut footnotes,
+                        open_footnote,
+                        render_table(&header, &rows, &aligns, width),
+                    );
                 }
             }
-            Event::Rule => push_block(&mut out, vec![rule()]),
+            Event::Rule => emit_block(&mut out, &mut footnotes, open_footnote, vec![rule()]),
             // The reference strips bold/italic markers inside a heading
             // rather than nesting SGR into the level style.
             Event::Start(Tag::Strong) if heading.is_some() => {}
