@@ -288,6 +288,15 @@ pub enum SessionEvent {
         attempt: u32,
         limit: u32,
     },
+    /// The ask tool wants an answer: the frontend shows the question panel
+    /// and replies through [`Agent::answer`]. Options are (label,
+    /// description) pairs; freeform adds a typed-answer slot.
+    Question {
+        id: u64,
+        question: String,
+        options: Vec<(String, String)>,
+        allow_freeform: bool,
+    },
     /// A steering message was accepted mid-turn (for display as a user block).
     Steered(String),
     /// The process was suspended and woke within the resume window; the
@@ -372,6 +381,9 @@ pub struct Agent {
     /// The latest observed system-sleep gap. Written by the turn's
     /// heartbeat task; tests write it through [`Agent::inject_sleep_gap`].
     wake: wake::Shared,
+    /// Ask-tool calls waiting on the user, keyed by tool id. The panel
+    /// answers through [`Agent::answer`]; Esc resolves them as cancelled.
+    asks: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Option<String>>>>>,
     options: AgentOptions,
 }
 
@@ -398,6 +410,7 @@ impl Agent {
             session_name: Arc::new(Mutex::new(None)),
             persist_warned: Arc::new(AtomicBool::new(false)),
             tool_seq: Arc::new(AtomicU64::new(0)),
+            asks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             wake: wake::shared(),
             options,
         };
@@ -585,6 +598,20 @@ impl Agent {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// Resolve a waiting ask-tool call: `Some(text)` is the user's answer,
+    /// `None` a dismissal (the tool records it as cancelled). Unknown ids —
+    /// a stale panel after Esc aborted the turn — are a no-op.
+    pub fn answer(&self, id: u64, reply: Option<String>) {
+        if let Some(tx) = self
+            .asks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
+            let _ = tx.send(reply);
+        }
+    }
+
     /// The extension-set session name, if any (the derived title still
     /// exists but the name overrides it in /resume).
     pub fn session_name(&self) -> Option<String> {
@@ -643,6 +670,7 @@ impl Agent {
         let host = self.host.clone();
         let tool_seq = self.tool_seq.clone();
         let wake = self.wake.clone();
+        let asks = self.asks.clone();
         let tool_mode = if model.supports_tools {
             self.options.tool_mode
         } else {
@@ -1197,6 +1225,7 @@ impl Agent {
                     let cancel = cancel.clone();
                     let events = events.clone();
                     let cwd = cwd.clone();
+                    let asks = asks.clone();
                     handles.push((
                         call.clone(),
                         tokio::spawn(async move {
@@ -1209,6 +1238,7 @@ impl Agent {
                                     cancel,
                                     id,
                                     events: events.clone(),
+                                    asks,
                                 },
                                 &call.name,
                                 &call.arguments,
@@ -1328,6 +1358,9 @@ impl Agent {
 
 /// Dispatch one tool call: extension hooks may block it, an extension that
 /// owns the name serves it, otherwise the built-in runs on a blocking thread.
+type AskRegistry =
+    Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<Option<String>>>>>;
+
 struct ToolRunContext {
     host: Option<std::sync::Arc<crate::core::api::ExtensionHost>>,
     tool_mode: ToolMode,
@@ -1335,6 +1368,80 @@ struct ToolRunContext {
     cancel: Arc<AtomicBool>,
     id: u64,
     events: mpsc::Sender<SessionEvent>,
+    asks: AskRegistry,
+}
+
+/// The ask tool runs here, not in the tool table: it blocks on the person
+/// at the keyboard, so it needs the event channel out and the answer
+/// registry back in. Esc resolves it as cancelled with the turn.
+async fn run_ask(
+    id: u64,
+    arguments: &str,
+    events: &mpsc::Sender<SessionEvent>,
+    asks: &AskRegistry,
+    cancel: &Arc<AtomicBool>,
+) -> tools::ToolOutput {
+    let args: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let question = args["question"].as_str().unwrap_or("").trim().to_string();
+    if question.is_empty() {
+        return tools::ToolOutput {
+            content: "ask: missing question".into(),
+            outcome: tools::ToolOutcome::Failed,
+            summary: "error".into(),
+            display: None,
+        };
+    }
+    let options: Vec<(String, String)> = args["options"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|o| {
+                    let label = o["label"].as_str()?.trim();
+                    if label.is_empty() {
+                        return None;
+                    }
+                    Some((
+                        label.to_string(),
+                        o["description"].as_str().unwrap_or("").trim().to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // With no options at all the freeform slot is the only way to answer.
+    let allow_freeform = args["allow_freeform"].as_bool().unwrap_or(true) || options.is_empty();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    asks.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, tx);
+    let _ = events
+        .send(SessionEvent::Question {
+            id,
+            question,
+            options,
+            allow_freeform,
+        })
+        .await;
+    let reply = tokio::select! {
+        answer = rx => answer.ok().flatten(),
+        _ = wait_cancelled(cancel) => None,
+    };
+    asks.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    match reply {
+        Some(text) => tools::ToolOutput {
+            content: text,
+            outcome: tools::ToolOutcome::Completed,
+            summary: "answered".into(),
+            display: None,
+        },
+        None => tools::ToolOutput {
+            content: "The user dismissed the question without answering.".into(),
+            outcome: tools::ToolOutcome::Cancelled,
+            summary: "cancelled".into(),
+            display: None,
+        },
+    }
 }
 
 async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools::ToolOutput {
@@ -1345,7 +1452,11 @@ async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools
         cancel,
         id,
         events,
+        asks,
     } = context;
+    if name == "ask" && tool_mode.allows(name) {
+        return run_ask(id, arguments, &events, &asks, &cancel).await;
+    }
     if !tool_mode.allows(name) {
         let mode = match tool_mode {
             ToolMode::ReadOnly => "read-only",
@@ -1508,6 +1619,7 @@ mod option_tests {
                 cancel: Arc::new(AtomicBool::new(false)),
                 id: 1,
                 events,
+                asks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             },
             "bash",
             r#"{"command":"touch should-not-exist"}"#,

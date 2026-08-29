@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::core::cli::ToolMode;
 
 mod bash;
+mod diffview;
 mod edit;
 mod fs;
 
@@ -166,6 +167,48 @@ fn target_command(args: &Value) -> String {
 fn target_pattern(args: &Value) -> String {
     sanitize_inline(args["pattern"].as_str().unwrap_or(""))
 }
+fn target_question(args: &Value) -> String {
+    sanitize_inline(args["question"].as_str().unwrap_or(""))
+}
+
+fn ask_schema() -> Value {
+    schema_object(
+        "ask",
+        "Ask the user one question and wait for their answer. Use it when you \
+         genuinely need a decision you cannot make from context — a choice \
+         between real alternatives, missing information only they have. Offer \
+         2-4 short options when the answers are enumerable; the user can \
+         always type a freeform answer unless allow_freeform is false.",
+        json!({
+            "question": {"type": "string", "description": "The question to ask, one sentence"},
+            "options": {
+                "type": "array",
+                "description": "Choices to offer, in order",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "Short answer text, returned verbatim when chosen"},
+                        "description": {"type": "string", "description": "One-line explanation of the choice"}
+                    },
+                    "required": ["label"]
+                }
+            },
+            "allow_freeform": {"type": "boolean", "description": "Allow a typed answer besides the options (default true)"}
+        }),
+        &["question"],
+    )
+}
+
+/// Never runs: the agent loop intercepts `ask` before dispatch, because it
+/// must block on the person at the keyboard through the event channel.
+fn ask_stub(_args: &Value, _cwd: &Path) -> ToolOutput {
+    ToolOutput {
+        content: "ask is only available in the interactive session".into(),
+        outcome: ToolOutcome::Failed,
+        summary: "error".into(),
+        display: None,
+    }
+}
 
 /// Everything a built-in tool is, in one row: schema and runner, the
 /// system-prompt one-liner, and the transcript's lifecycle labels. One
@@ -225,6 +268,16 @@ static SPECS: &[Spec] = &[
         target: target_pattern,
         schema: fs::grep_schema,
         run: fs::grep,
+    },
+    Spec {
+        name: "ask",
+        snippet: "Ask the user one question and wait for the answer. Offer short options when the answers are enumerable.",
+        category: "ask",
+        running: "Asking",
+        completed: "Asked",
+        target: target_question,
+        schema: ask_schema,
+        run: ask_stub,
     },
     Spec {
         name: "bash",
@@ -593,7 +646,8 @@ mod tests {
 
     #[test]
     fn safety_modes_filter_the_model_visible_contract() {
-        assert_eq!(names(ToolMode::ReadOnly), vec!["read", "grep"]);
+        // Asking the user mutates nothing, so read-only sessions keep it.
+        assert_eq!(names(ToolMode::ReadOnly), vec!["read", "grep", "ask"]);
         assert!(names(ToolMode::None).is_empty());
         assert_eq!(names(ToolMode::All).len(), schemas().len());
     }

@@ -193,14 +193,27 @@ impl Block {
         self.touch();
     }
 
+    /// Close a restored group: no more children arrive, and any child still
+    /// pending never reported — the header says so instead of silently
+    /// tallying rows that don't render.
+    pub fn seal(&mut self) {
+        self.done = true;
+        self.refresh_tool_header();
+        self.touch();
+    }
+
     fn refresh_tool_header(&mut self) {
         let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut unreported = 0usize;
         let mut timed_out = 0usize;
         let mut failed = 0usize;
         let mut denied = 0usize;
         let mut cancelled = 0usize;
         for child in &self.tool_children {
             match child.state {
+                // Live groups still have work in flight; a sealed group's
+                // pending child is a recorded call whose result never came.
+                ToolState::Pending if self.done => unreported += 1,
                 ToolState::TimedOut => timed_out += 1,
                 ToolState::Failed => failed += 1,
                 ToolState::Blocked => denied += 1,
@@ -215,7 +228,8 @@ impl Block {
         }
         // The reference orders category tallies by descending count (a stable
         // sort keeps first-seen order for ties), then the outcome tallies in
-        // its fixed grammar: timed out · failed · denied · cancelled.
+        // its fixed grammar: unreported · timed out · failed · denied ·
+        // cancelled.
         counts.sort_by_key(|a| std::cmp::Reverse(a.1));
         let count = self.tool_children.len();
         let mut header = format!("{count} tool call{}", if count == 1 { "" } else { "s" });
@@ -223,6 +237,7 @@ impl Block {
             header.push_str(&format!(" · {}", category_tally(&category, count)));
         }
         for (count, label) in [
+            (unreported, "unreported"),
             (timed_out, "timed out"),
             (failed, "failed"),
             (denied, "denied"),
@@ -387,6 +402,19 @@ impl Block {
                 }
                 for (index, child) in self.tool_children.iter().enumerate() {
                     if child.state == ToolState::Pending {
+                        // Mid-run, a pending call has no row yet. In a sealed
+                        // group the call is on record and its result never
+                        // came — say so, the reference's own fallback line.
+                        if !self.done {
+                            continue;
+                        }
+                        let last = index + 1 == self.tool_children.len();
+                        let connector = if last { "└" } else { "├" };
+                        rows.push(format!(
+                            "{} {}",
+                            theme.fg("muted", connector),
+                            theme.fg("muted", "Tool completion was not reported")
+                        ));
                         continue;
                     }
                     let last = index + 1 == self.tool_children.len();

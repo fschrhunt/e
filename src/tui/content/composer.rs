@@ -23,6 +23,9 @@ pub struct Editor {
     /// Inner width from the latest render; vertical arrow keys need the
     /// visual layout to know whether a line movement is possible.
     inner_width: Option<usize>,
+    /// First visible visual row when the draft outgrows the composer's
+    /// share of the frame — the window follows the cursor.
+    scroll: usize,
 }
 
 pub enum EditorResult {
@@ -120,6 +123,7 @@ impl Editor {
             pastes: Vec::new(),
             paste_seq: 0,
             inner_width: None,
+            scroll: 0,
         }
     }
 
@@ -176,11 +180,11 @@ impl Editor {
     }
 
     /// A paste becomes a placeholder token — the reference behavior — when
-    /// it is long or multiline; the token expands back on submit. Small
-    /// single-line pastes insert literally.
+    /// it runs past a thousand codepoints, line count regardless; the token
+    /// expands back on submit. Anything smaller inserts literally.
     pub fn insert_paste(&mut self, text: &str) {
         let lines = text.lines().count().max(1);
-        if lines == 1 && text.chars().count() <= 120 {
+        if text.chars().count() <= 1000 {
             self.insert_str(text);
             return;
         }
@@ -352,8 +356,11 @@ impl Editor {
     }
 
     /// Render the composer band: the reference's full-width divider above,
-    /// then railed rows with a reverse-video cursor cell.
-    pub fn render(&mut self, theme: &Theme, width: usize) -> Vec<String> {
+    /// then railed rows with a reverse-video cursor cell. At most
+    /// `max_body_rows` draft rows show; a longer draft scrolls behind a
+    /// cursor-following window whose first row wears `┃↑` when rows hide
+    /// above.
+    pub fn render(&mut self, theme: &Theme, width: usize, max_body_rows: usize) -> Vec<String> {
         // A draft starting with `!` is a shell command: the rail turns the
         // bash-mode color — the whole indicator, no words.
         let rail_token =
@@ -378,6 +385,7 @@ impl Editor {
         let rows = layout_rows(&chars, inner);
         let cursor_row = row_of(&rows, self.cursor);
         let last = rows.len() - 1;
+        let mut body: Vec<String> = Vec::with_capacity(rows.len() + 1);
         for (index, row) in rows.iter().enumerate() {
             let slice = &chars[row.start..row.end];
             let full_final_row = index == last
@@ -397,16 +405,47 @@ impl Editor {
             } else {
                 slice.iter().collect()
             };
-            out.push(format!("{rail}{rendered}"));
+            body.push(rendered);
         }
         // A cursor resting past a full final row needs one extra empty row.
-        if rows.last().is_some_and(|row| {
+        let trailing_cursor = rows.last().is_some_and(|row| {
             self.cursor == self.text.len()
                 && !self.text.is_empty()
                 && self.cursor == row.end
                 && row_width(&chars, row) >= inner
-        }) {
-            out.push(format!("{rail}\x1b[7m \x1b[27m"));
+        });
+        if trailing_cursor {
+            body.push("\x1b[7m \x1b[27m".to_string());
+        }
+
+        // The cursor-following window: the draft keeps its share of the
+        // frame, older rows scroll behind a `┃↑` marker on the first
+        // visible row instead of shoving the transcript off screen.
+        let cap = max_body_rows.max(1);
+        let focus = if trailing_cursor {
+            body.len() - 1
+        } else {
+            cursor_row.unwrap_or(0)
+        };
+        if body.len() <= cap {
+            self.scroll = 0;
+        } else {
+            if self.scroll > focus {
+                self.scroll = focus;
+            }
+            if focus >= self.scroll + cap {
+                self.scroll = focus + 1 - cap;
+            }
+            if self.scroll + cap > body.len() {
+                self.scroll = body.len() - cap;
+            }
+        }
+        for (i, rendered) in body.iter().enumerate().skip(self.scroll).take(cap) {
+            if i == self.scroll && self.scroll > 0 {
+                out.push(format!("{}{rendered}", theme.fg(rail_token, "┃↑")));
+            } else {
+                out.push(format!("{rail}{rendered}"));
+            }
         }
         out
     }

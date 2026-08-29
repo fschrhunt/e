@@ -19,7 +19,6 @@
 //! MAX_VISIBLE, shrinking with a short match list instead of blank-padding.
 
 use crate::tui::markdown::visible_width;
-use crate::tui::render::bold;
 use crate::tui::theme::Theme;
 
 #[derive(Clone)]
@@ -71,6 +70,25 @@ pub const HINT_SCOPED: &str =
     "↑↓ Navigate     Space Toggle     Ctrl+X Reset     Enter Done     Esc Close";
 /// The reference keeps six selectable rows below the header.
 const MAX_VISIBLE: usize = 6;
+
+/// The char indices `fuzzy_score`'s walk would hit — the spans the picker
+/// brightens so a filtered row shows why it matched. None when the query is
+/// not a subsequence of the candidate.
+pub fn fuzzy_positions(query: &str, candidate: &str) -> Option<Vec<usize>> {
+    if query.is_empty() {
+        return Some(Vec::new());
+    }
+    let lower = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let chars: Vec<char> = candidate.chars().map(lower).collect();
+    let mut positions = Vec::with_capacity(query.chars().count());
+    let mut from = 0usize;
+    for needle in query.chars().map(lower) {
+        let at = chars[from..].iter().position(|&c| c == needle)? + from;
+        positions.push(at);
+        from = at + 1;
+    }
+    Some(positions)
+}
 
 /// Subsequence fuzzy match; lower score is better, None is no match.
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
@@ -203,19 +221,34 @@ impl Menu {
         }
     }
 
-    /// The selected row's dress. The reference splits its pickers: the model
-    /// surfaces signal by brightness alone, every other picker fills the row
-    /// — selection background, selection ink.
-    fn selected_style(&self, theme: &Theme, text: &str) -> String {
+    /// The row's dress as an open/close pair, so matched spans can reset
+    /// and reopen mid-run. The reference splits its pickers: the model
+    /// surfaces signal by brightness alone, every other picker fills the
+    /// row — selection background, selection ink; unselected rows are dim.
+    fn row_style(&self, theme: &Theme, selected: bool) -> (String, String) {
+        if !selected {
+            let open = theme.fg_prefix("dim").to_string();
+            let close = if open.is_empty() { "" } else { "\x1b[39m" };
+            return (open, close.into());
+        }
+        let bright = || {
+            let fg = theme.fg_prefix("userMessageText");
+            let close = if fg.is_empty() {
+                "\x1b[22m"
+            } else {
+                "\x1b[39m\x1b[22m"
+            };
+            (format!("\x1b[1m{fg}"), close.to_string())
+        };
         match self.kind {
-            MenuKind::Models | MenuKind::Scoped => bold(&theme.fg("userMessageText", text)),
+            MenuKind::Models | MenuKind::Scoped => bright(),
             _ => {
                 let bg = theme.bg_prefix("selectedBg");
                 let fg = theme.fg_prefix("selectedText");
                 if bg.is_empty() && fg.is_empty() {
-                    bold(&theme.fg("userMessageText", text))
+                    bright()
                 } else {
-                    format!("{bg}{fg}{text}\x1b[0m")
+                    (format!("{bg}{fg}"), "\x1b[0m".into())
                 }
             }
         }
@@ -259,14 +292,24 @@ impl Menu {
         for slot in self.window_start..window_end {
             let item = &self.items[self.filtered[slot]];
             let selected = slot == self.selected;
-            // One plain row — label column, three-space gap, description,
-            // right-aligned metadata — styled as a whole: the selected dress
-            // or dim, never mixed runs.
-            let mut content = format!(
-                "{}{}",
-                item.label,
-                " ".repeat(label_width.saturating_sub(visible_width(&item.label)))
-            );
+            let (open, close) = self.row_style(theme, selected);
+            // The label, with the query's matched chars brightened: each hit
+            // resets to bold and reopens the row's own dress after — the
+            // reference's way of showing why a filtered row matched.
+            let marks = if self.query.is_empty() {
+                Vec::new()
+            } else {
+                fuzzy_positions(&self.query, &item.label).unwrap_or_default()
+            };
+            let mut content = String::new();
+            for (i, c) in item.label.chars().enumerate() {
+                if marks.contains(&i) {
+                    content.push_str(&format!("\x1b[1m{c}\x1b[0m{open}"));
+                } else {
+                    content.push(c);
+                }
+            }
+            content.push_str(&" ".repeat(label_width.saturating_sub(visible_width(&item.label))));
             if !item.description.is_empty() {
                 content.push_str("   ");
                 content.push_str(&item.description);
@@ -279,15 +322,10 @@ impl Menu {
                     content.push_str(&item.meta);
                 }
             }
-            let styled = if selected {
-                self.selected_style(theme, &content)
-            } else {
-                theme.fg("dim", &content)
-            };
             // Escape-aware clipping: SGR runs are zero columns and a cut row
             // closes its styles instead of severing a sequence mid-run.
             body.push(crate::tui::markdown::clip_styled(
-                &format!("  {styled}"),
+                &format!("  {open}{content}{close}"),
                 width,
             ));
         }

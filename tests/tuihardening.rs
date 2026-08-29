@@ -114,7 +114,7 @@ fn composer_uses_display_width_and_one_cursor() {
     // Inner width is 8; eight CJK chars are 16 columns → at least two rows.
     let mut editor = Editor::new();
     editor.set_text("界界界界界界界界");
-    let rows = editor.render(&theme, 10);
+    let rows = editor.render(&theme, 10, 24);
     let content_rows = rows.len() - 1; // leading blank
     assert!(
         content_rows >= 2,
@@ -124,7 +124,7 @@ fn composer_uses_display_width_and_one_cursor() {
     // A cursor at a wrap boundary paints exactly one reverse-video cell.
     let mut editor = Editor::new();
     editor.set_text("abcdefghijklmnop");
-    let rows = editor.render(&theme, 10);
+    let rows = editor.render(&theme, 10, 24);
     let cursors: usize = rows.iter().map(|r| r.matches("\x1b[7m").count()).sum();
     assert_eq!(
         cursors, 1,
@@ -133,16 +133,27 @@ fn composer_uses_display_width_and_one_cursor() {
 }
 
 /// Submitting a draft retires its paste placeholders: a stale token typed
-/// later must not re-expand an old payload.
+/// later must not re-expand an old payload. Only a paste past a thousand
+/// codepoints collapses — the reference threshold — so a short multiline
+/// paste inserts literally.
 #[test]
 fn paste_placeholders_retire_on_submit() {
     use e::tui::composer::Editor;
     let mut editor = Editor::new();
     editor.insert_paste("line one\nline two\nline three");
+    assert!(
+        !editor.text().contains("[Pasted text"),
+        "a short paste must insert literally"
+    );
+
+    let mut editor = Editor::new();
+    let long = format!("line one\nline two\n{}", "x".repeat(1200));
+    editor.insert_paste(&long);
     let draft = editor.text();
     assert!(draft.contains("[Pasted text #1"));
     let expanded = editor.expand_pastes(&draft);
     assert!(expanded.contains("line two"));
+    assert!(expanded.contains("xxxx"));
     // The mapping is gone: the same token now passes through literally.
     let again = editor.expand_pastes(&draft);
     assert!(

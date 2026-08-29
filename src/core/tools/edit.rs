@@ -63,17 +63,14 @@ pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
             let deletions = old.lines().count();
             // The model authored old_string and new_string one message ago —
             // echoing them back would pay for the diff a second time on
-            // every later request. The diff goes to the detail viewer.
+            // every later request. The diff goes to the detail viewer: real
+            // file line numbers, context, and elision, computed against the
+            // whole file so the numbers are the ones an editor would show.
             let mut detail = format!("edited {path}");
-            if !old.is_empty() || !new.is_empty() {
-                detail.push_str("\n--- before\n");
-                for line in old.lines() {
-                    detail.push_str(&format!("-{line}\n"));
-                }
-                detail.push_str("+++ after\n");
-                for line in new.lines() {
-                    detail.push_str(&format!("+{line}\n"));
-                }
+            let diff = super::diffview::render(&text, &updated);
+            if !diff.is_empty() {
+                detail.push('\n');
+                detail.push_str(&diff);
             }
             ToolOutput {
                 content: format!("edited {path}"),

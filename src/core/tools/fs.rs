@@ -206,6 +206,15 @@ pub fn write(args: &Value, cwd: &Path) -> ToolOutput {
         Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
         Err(error) => return err(format!("write {path}: {error}")),
     };
+    // Capture the previous content while it still exists, so the detail
+    // viewer can show a real diff. Bounded: a huge or non-UTF-8 previous
+    // file degrades to the summary-only detail, never an error.
+    const DIFF_SOURCE_CAP: u64 = 2 * 1024 * 1024;
+    let before_text = match std::fs::metadata(&full) {
+        Ok(meta) if meta.len() <= DIFF_SOURCE_CAP => std::fs::read_to_string(&full).ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(String::new()),
+        _ => None,
+    };
     if let Some(parent) = full.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             return err(format!("write {path}: {error}"));
@@ -219,16 +228,22 @@ pub fn write(args: &Value, cwd: &Path) -> ToolOutput {
             // The model wrote this content one message ago — echoing it back
             // would bill the whole file into the context a second time (and
             // again on every later request). The full diff goes to the
-            // detail viewer instead.
-            let detail = format!(
-                "wrote {path}\n[replaced {before_lines} line(s) with {} line(s)]",
-                content.lines().count()
-            );
+            // detail viewer instead: line numbers, context, elision.
+            let detail = match before_text
+                .as_deref()
+                .map(|before| super::diffview::render(before, content))
+            {
+                Some(diff) if !diff.is_empty() => format!("wrote {path}\n{diff}"),
+                _ => format!(
+                    "wrote {path}\n[replaced {before_lines} line(s) with {} line(s)]",
+                    content.lines().count()
+                ),
+            };
             ToolOutput {
                 content: format!("wrote {path} ({} lines)", content.lines().count()),
                 outcome: ToolOutcome::Completed,
                 summary: format!("+{additions} -{deletions}"),
-                display: Some(detail),
+                display: Some(super::truncate(detail)),
             }
         }
         Err(e) => err(format!("write {path}: {e}")),

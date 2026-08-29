@@ -250,6 +250,9 @@ struct App {
     outputs: Vec<(String, String)>,
     /// The ctrl+o full-detail viewer, when open.
     viewer: Option<Viewer>,
+    /// The ask tool's open question, and any batch-mates queued behind it.
+    question: Option<crate::tui::questionpanel::Question>,
+    question_queue: std::collections::VecDeque<crate::tui::questionpanel::Question>,
     /// Bumped whenever session identity changes (/new, resume). Async work
     /// launched in one epoch may not mutate a later one: a late extension
     /// command or shell result carries the epoch it started in and is
@@ -294,7 +297,10 @@ impl App {
         let body: Vec<&str> = content.lines().collect();
         let window = height.saturating_sub(4).max(1);
         for line in body.iter().skip(viewer.scroll).take(window) {
-            rows.push(crate::tui::markdown::clip_styled(line, width));
+            let shown = self
+                .diff_row_color(line)
+                .unwrap_or_else(|| line.to_string());
+            rows.push(crate::tui::markdown::clip_styled(&shown, width));
         }
         while rows.len() < height.saturating_sub(1) {
             rows.push(String::new());
@@ -304,6 +310,41 @@ impl App {
             "Full detail · ←/→ switch · ↑↓/pgup·pgdn scroll · ctrl o close · Esc close",
         ));
         rows
+    }
+
+    /// Color a detail-viewer row shaped like a diff row: the number-and-sign
+    /// column takes the diff-marker hue (`+` green, `-` red), context and
+    /// `⋯` elision rows dim, anything else passes through untouched — the
+    /// reference keeps the changed text itself neutral.
+    fn diff_row_color(&self, line: &str) -> Option<String> {
+        if line.trim() == "⋯" && line.starts_with("      ") {
+            return Some(self.theme.fg("dim", line));
+        }
+        let field = line.get(..5)?;
+        let number = field.trim_start();
+        if number.is_empty()
+            || !number.bytes().all(|b| b.is_ascii_digit())
+            || *field != format!("{number:>5}")
+        {
+            return None;
+        }
+        let rest = &line[5..];
+        if rest.is_empty() || rest.starts_with("   ") {
+            return Some(self.theme.fg("dim", line));
+        }
+        let added = if rest == " +" || rest.starts_with(" + ") {
+            true
+        } else if rest == " -" || rest.starts_with(" - ") {
+            false
+        } else {
+            return None;
+        };
+        let token = crate::tui::theme::Theme::diff_marker_token(added);
+        Some(format!(
+            "{}{}",
+            self.theme.fg(token, &line[..7]),
+            &line[7..]
+        ))
     }
 
     /// The workspace's current git branch, from `.git/HEAD` — a plain file
@@ -325,7 +366,7 @@ impl App {
         (!name.is_empty()).then(|| name.to_string())
     }
 
-    fn frame(&mut self, width: usize) -> Vec<String> {
+    fn frame(&mut self, width: usize, height: usize) -> Vec<String> {
         let blink_on = self
             .active
             .as_ref()
@@ -375,11 +416,16 @@ impl App {
         }
         let entering_key = matches!(self.auth, Some(AuthStage::ApiKey { .. }));
         if !entering_key {
-            lines.extend(self.editor.render(&self.theme, width));
+            // The reference caps the composer at half the frame plus one
+            // row; a longer draft scrolls behind the ┃↑ marker.
+            let cap = (height / 2 + 1).max(3);
+            lines.extend(self.editor.render(&self.theme, width, cap));
         }
         if let Some(stage) = &self.trust {
             let dir = self.agent.cwd().to_string_lossy().into_owned();
             lines.extend(trustpanel::render(stage, &self.theme, width, &dir));
+        } else if let Some(question) = &self.question {
+            lines.extend(question.render(&self.theme, width));
         } else if let Some(stage) = &self.auth {
             lines.extend(authpanel::render(
                 stage,
@@ -417,15 +463,18 @@ impl App {
             workspace: Some(workspace),
             branch: Self::git_branch(&cwd),
         };
-        let hint = self
-            .settings
-            .as_ref()
-            .map(|_| crate::tui::settingspanel::HINT)
-            .or_else(|| self.menu.as_ref().map(|m| m.hint))
-            .map(|h| crate::tui::menu::degrade_hint(h, width));
+        let question_hint = self.question.as_ref().map(|q| q.hint());
+        let hint = question_hint.as_deref().or_else(|| {
+            self.settings
+                .as_ref()
+                .map(|_| crate::tui::settingspanel::HINT)
+                .or_else(|| self.menu.as_ref().map(|m| m.hint))
+                .map(|h| crate::tui::menu::degrade_hint(h, width))
+        });
         // A framed surface's bottom divider sits directly above the hint
         // row — the blank spacer belongs only to the bare-composer layout.
         let panel_open = self.trust.is_some()
+            || self.question.is_some()
             || self.auth.is_some()
             || self.settings.is_some()
             || self.menu.is_some();
@@ -527,9 +576,13 @@ impl App {
         self.transcript.clear();
         let mut restored_calls = std::collections::HashMap::<String, (usize, u64)>::new();
         let mut restored_id = 0u64;
+        // Consecutive tool batches with no assistant voice between them were
+        // one growing tree live — the replay keeps them one tree.
+        let mut open_group: Option<usize> = None;
         for m in messages {
             match m.role.as_str() {
                 "user" => {
+                    open_group = None;
                     let mut content = m.content.clone();
                     if !m.images.is_empty() {
                         content.push_str(&format!(
@@ -542,6 +595,7 @@ impl App {
                 }
                 "assistant" => {
                     if !m.content.trim().is_empty() {
+                        open_group = None;
                         self.transcript
                             .push(Block::new(Kind::Assistant, m.content.clone()));
                     }
@@ -562,7 +616,17 @@ impl App {
                             ));
                             ids.push((call.id.clone(), restored_id));
                         }
-                        let block = self.transcript.push(Block::tool_group(children));
+                        let block = match open_group {
+                            Some(idx) => {
+                                if let Some(group) = self.transcript.blocks.get_mut(idx) {
+                                    group.tool_children.extend(children);
+                                    group.touch();
+                                }
+                                idx
+                            }
+                            None => self.transcript.push(Block::tool_group(children)),
+                        };
+                        open_group = Some(block);
                         for (call_id, id) in ids {
                             restored_calls.insert(call_id, (block, id));
                         }
@@ -580,12 +644,38 @@ impl App {
                         .as_ref()
                         .map(|meta| (meta.outcome, meta.summary.clone()))
                         .unwrap_or((crate::core::tools::ToolOutcome::Completed, "done".into()));
+                    let mut title = None;
                     if let Some(group) = self.transcript.blocks.get_mut(block) {
                         group.start_tool(id);
+                        if let Some(child) = group.tool_children.iter().find(|child| child.id == id)
+                        {
+                            title = Some(if child.target.is_empty() {
+                                child.completed.clone()
+                            } else {
+                                format!("{} {}", child.completed, child.target)
+                            });
+                        }
                         group.finish_tool(id, outcome, summary, &m.content);
+                    }
+                    // Recorded results come back to the ctrl+o viewer, the
+                    // same store the live session fills.
+                    if !m.content.trim().is_empty() {
+                        self.remember_output(
+                            title.unwrap_or_else(|| "tool output".into()),
+                            crate::core::tools::sanitize_display(&m.content),
+                        );
                     }
                 }
                 _ => {}
+            }
+        }
+        // Seal every restored group: no more results are coming, so a child
+        // still pending renders (and tallies) as unreported instead of
+        // silently vanishing, and a later live batch starts its own tree
+        // instead of splicing into a restored one.
+        for block in &mut self.transcript.blocks {
+            if block.kind == Kind::ToolGroup {
+                block.seal();
             }
         }
         // Seed the context gauge from the restored history so the statusline
@@ -876,15 +966,21 @@ impl App {
             "/quit" | "/exit" => self.should_quit = true,
             "/version" => self.notice(format!("e {}", crate::VERSION)),
             "/help" => {
-                let mut help = "commands:\n  /login [provider]   sign in (API key or account)\n  /models [name]      list or switch models\n  /scoped-models      choose which models ctrl+p cycles\n  /reload             reload extensions, themes, and config\n  /new                fresh session\n  /resume             resume a saved session\n  /tree               rewind to an earlier point and branch\n  /compact            summarize into a fresh session\n  /trust              trust this directory (loads its AGENTS.md, .e skills and prompts)\n  ! <cmd>              run a shell command; the model sees the output\n  shift+tab           cycle reasoning effort (per model)\n  /version            show the version\n  /quit               exit".to_string();
-                let ext_commands = self.host.commands();
-                if !ext_commands.is_empty() {
-                    help.push_str("\n\nextension commands:");
-                    for (name, description) in ext_commands {
-                        help.push_str(&format!("\n  /{name:<21}{description}"));
-                    }
-                }
-                self.notice(help);
+                // The reference help surface is the commands picker itself —
+                // browse, filter, Enter to use — not a wall of text. The
+                // non-command shortcuts ride the transcript as one notice so
+                // they stay discoverable.
+                self.notice(
+                    "! <cmd> runs a shell command (the model sees the output) · \
+                     shift+tab cycles reasoning effort · ctrl+o opens full tool detail"
+                        .into(),
+                );
+                self.menu = Some(crate::tui::menu::Menu::new(
+                    crate::tui::menu::MenuKind::Commands,
+                    "Commands",
+                    crate::tui::menu::HINT_USE,
+                    self.command_items(),
+                ));
             }
             "/new" | "/clear" => {
                 // A running turn owns the history and session log; replacing
@@ -1656,6 +1752,8 @@ pub async fn run(
         reload_block: None,
         outputs: Vec::new(),
         viewer: None,
+        question: None,
+        question_queue: std::collections::VecDeque::new(),
         session_epoch: 0,
         update_installed: None,
         relaunch: false,
@@ -1742,7 +1840,7 @@ pub async fn run(
     if let Some(initial) = stage_initial_prompt(initial, hold_initial, &mut app.pending_initial) {
         app.submit_initial(initial);
     }
-    painter.frame(app.frame(cols as usize));
+    painter.frame(app.frame(cols as usize, rows as usize));
 
     // Frame pacing: every select arm may change what's on screen, but frames
     // are built at most once per interval — a token burst becomes one paint,
@@ -1841,6 +1939,48 @@ pub async fn run(
                                     }
                                 }
                                 _ => {}
+                            }
+                        } else if app.question.is_some() {
+                            // The ask tool's panel owns the keys while open.
+                            // Esc dismisses the question (the tool records a
+                            // cancel) without aborting the turn; a digit
+                            // chooses and answers in one stroke.
+                            let mut submit: Option<Option<String>> = None;
+                            if let Some(q) = &mut app.question {
+                                match k.code {
+                                    KeyCode::Esc => submit = Some(None),
+                                    KeyCode::Up => q.step(-1),
+                                    KeyCode::Down => q.step(1),
+                                    KeyCode::Enter => {
+                                        if let Some(text) = q.answer() {
+                                            submit = Some(Some(text));
+                                        }
+                                    }
+                                    KeyCode::Backspace if q.freeform_selected() => {
+                                        q.freeform.pop();
+                                    }
+                                    KeyCode::Char(c) if !ctrl => {
+                                        if q.freeform_selected() {
+                                            q.freeform.push(c);
+                                        } else if let Some(n) = c.to_digit(10) {
+                                            if q.choose(n as usize) {
+                                                if let Some(text) = q.answer() {
+                                                    submit = Some(Some(text));
+                                                }
+                                            }
+                                        } else if q.allow_freeform {
+                                            q.selected = q.options.len();
+                                            q.freeform.push(c);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(reply) = submit {
+                                if let Some(q) = app.question.take() {
+                                    app.agent.answer(q.id, reply);
+                                }
+                                app.question = app.question_queue.pop_front();
                             }
                         } else if let Some(panel) = &mut app.settings {
                             let mut setting_error = None;
@@ -2292,7 +2432,7 @@ pub async fn run(
             let frame = if app.viewer.is_some() {
                 app.viewer_frame(cols as usize, rows as usize)
             } else {
-                app.frame(cols as usize)
+                app.frame(cols as usize, rows as usize)
             };
             painter.frame(frame);
             next_paint = now + FRAME_INTERVAL;
@@ -2708,6 +2848,8 @@ mod tests {
             reload_block: None,
             outputs: Vec::new(),
             viewer: None,
+            question: None,
+            question_queue: std::collections::VecDeque::new(),
             session_epoch: 0,
             update_installed: None,
             relaunch: false,

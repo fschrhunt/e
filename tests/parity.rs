@@ -566,7 +566,26 @@ fn picker_band_shrinks_with_its_rows() {
     menu.set_query("cmd15");
     let filtered = menu.render(&theme, 80);
     assert_eq!(filtered.len(), 1 + 4);
-    assert!(filtered[3].contains("/cmd15"));
+    // The matched chars are brightened, so compare the escape-stripped row.
+    let strip = |row: &str| -> String {
+        let mut out = String::new();
+        let mut chars = row.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for e in chars.by_ref() {
+                    if e.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    };
+    assert!(strip(&filtered[3]).contains("/cmd15"), "{:?}", filtered[3]);
+    // The match highlight itself: a bold mark rides inside the row.
+    assert!(filtered[3].contains("\x1b[1mc"), "{:?}", filtered[3]);
     assert!(filtered[1].contains("Commands 1"), "{:?}", filtered[1]);
     assert!(!filtered[1].contains("Type to filter"), "{:?}", filtered[1]);
 
@@ -575,6 +594,77 @@ fn picker_band_shrinks_with_its_rows() {
     let empty = menu.render(&theme, 80);
     assert_eq!(empty.len(), 1 + 4);
     assert!(empty[3].contains("no matching slash commands"));
+}
+
+#[test]
+fn question_panel_frames_options_with_brightness_selection() {
+    use e::tui::questionpanel::Question;
+    let theme = e::tui::theme::resolve("dark", false);
+    let mut q = Question::new(
+        7,
+        "Pick a color".into(),
+        vec![
+            ("blue".into(), "the calm one".into()),
+            ("red".into(), String::new()),
+        ],
+        true,
+    );
+    let rows = q.render(&theme, 80);
+    // Framed like every footer surface: divider, question, blank, options,
+    // freeform slot, divider.
+    assert_eq!(rows.len(), 4 + 3);
+    assert!(rows[1].contains("Pick a color") && rows[1].contains("\x1b[1m"));
+    assert!(rows[3].contains("1) blue") && rows[3].contains("the calm one"));
+    assert!(rows[4].contains("2) red"));
+    assert!(rows[5].contains("3) Type an answer…"));
+    // Selection is brightness alone — no caret anywhere.
+    assert!(!rows.iter().any(|r| r.contains('›')));
+    assert_eq!(q.answer().as_deref(), Some("blue"));
+
+    // The freeform slot answers with the typed text, or refuses empty.
+    q.selected = 2;
+    assert!(q.freeform_selected());
+    assert_eq!(q.answer(), None);
+    q.freeform = "teal".into();
+    assert_eq!(q.answer().as_deref(), Some("teal"));
+    assert!(q.hint().starts_with("Type answer"));
+}
+
+#[test]
+fn sealed_groups_report_missing_results_instead_of_hiding_them() {
+    use e::tui::transcript::{Block, ToolChild};
+    let theme = e::tui::theme::resolve("dark", false);
+    let mut group = Block::tool_group(vec![
+        ToolChild::pending(
+            1,
+            "read".into(),
+            "Reading".into(),
+            "Read".into(),
+            "a.rs".into(),
+        ),
+        ToolChild::pending(
+            2,
+            "read".into(),
+            "Reading".into(),
+            "Read".into(),
+            "b.rs".into(),
+        ),
+    ]);
+    group.start_tool(1);
+    group.finish_tool(1, e::core::tools::ToolOutcome::Completed, "done".into(), "");
+    // Live: the second call is pending — no row, no unreported tally.
+    let live = group.lines_for_test(&theme, 80);
+    assert_eq!(live.len(), 2);
+    assert!(!group.text.contains("unreported"));
+
+    // Sealed (a restored session): the recorded call whose result never
+    // came gets an explicit row and an `unreported` tally — a header that
+    // says "2 tool calls" sits above two rows, not one.
+    group.seal();
+    assert!(group.text.contains("· 1 unreported"), "{}", group.text);
+    let sealed = group.lines_for_test(&theme, 80);
+    assert_eq!(sealed.len(), 3);
+    assert!(sealed[2].contains("Tool completion was not reported"));
 }
 
 #[test]

@@ -10,7 +10,7 @@ use e::tui::theme;
 fn rows(text: &str, width: usize) -> Vec<String> {
     let mut editor = Editor::new();
     editor.set_text(text);
-    editor.render(&theme::resolve("dark", false), width)
+    editor.render(&theme::resolve("dark", false), width, 24)
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn up_down_move_between_visual_rows_and_fall_back_to_history() {
     // into the first visual row.
     let mut editor = Editor::new();
     editor.set_text("hello world extra");
-    editor.render(&theme, 10); // establishes the layout width
+    editor.render(&theme, 10, 24); // establishes the layout width
     let end = editor.cursor();
     use e::tui::composer::Key;
     editor.key(Key::Up);
@@ -83,7 +83,7 @@ fn up_down_move_between_visual_rows_and_fall_back_to_history() {
     let mut editor = Editor::new();
     editor.set_text("draft");
     editor.push_history("older".into());
-    editor.render(&theme, 40);
+    editor.render(&theme, 40, 24);
     editor.key(Key::Up);
     assert_eq!(editor.text(), "older");
 }

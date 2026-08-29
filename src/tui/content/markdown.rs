@@ -32,6 +32,14 @@ fn osc8(url: &str) -> String {
 }
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
+/// A URL safe to embed in an OSC 8 sequence: bounded, and free of control
+/// bytes that would terminate or corrupt the sequence (a `\x07` or `\x1b`
+/// inside the payload breaks out of the hyperlink and leaks the rest as
+/// terminal input). Anything else renders as plain text instead.
+fn valid_link_url(url: &str) -> bool {
+    url.len() <= 2083 && !url.chars().any(|c| c.is_control())
+}
+
 /// Visible width of a styled string (ANSI SGR and OSC sequences are zero).
 pub fn visible_width(styled: &str) -> usize {
     let mut width = 0;
@@ -631,8 +639,8 @@ fn push_text_autolinked(inline: &mut String, text: &str) {
             }
         }
         let scheme_len = if url.starts_with("https://") { 8 } else { 7 };
-        if url.len() <= scheme_len {
-            // A bare scheme is text, not a link.
+        if url.len() <= scheme_len || !valid_link_url(url) {
+            // A bare scheme is text, not a link; so is an invalid URL.
             inline.push_str(&tail[..end]);
         } else {
             inline.push_str(&osc8(url));
@@ -675,6 +683,9 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
     let mut current_task: Option<bool> = None;
     let mut quote_depth = 0usize;
     let mut in_link = false;
+    // Whether the open link/image actually emitted an OSC 8 open (a URL
+    // that failed validation did not, so its end must not close one).
+    let mut link_hot = false;
     let mut image_mark: Option<usize> = None;
     let mut code: Option<(String, String)> = None; // (lang, buffer)
     #[allow(clippy::type_complexity)]
@@ -855,13 +866,20 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             Event::End(TagEnd::Strikethrough) => inline.push_str(STRIKE_OFF),
             Event::Start(Tag::Link { dest_url, .. }) => {
                 in_link = true;
-                inline.push_str(&osc8(&dest_url));
+                // An oversized or control-laden URL never enters an OSC 8
+                // sequence; its label renders as plain underlined text.
+                link_hot = valid_link_url(&dest_url);
+                if link_hot {
+                    inline.push_str(&osc8(&dest_url));
+                }
                 inline.push_str(UNDERLINE_ON);
             }
             Event::End(TagEnd::Link) => {
                 in_link = false;
                 inline.push_str(UNDERLINE_OFF);
-                inline.push_str(OSC8_CLOSE);
+                if link_hot {
+                    inline.push_str(OSC8_CLOSE);
+                }
                 // An underlined heading level reopens its underline after
                 // the link closes its own.
                 if matches!(heading, Some(1) | Some(3) | Some(5)) {
@@ -870,7 +888,10 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
                 in_link = true;
-                inline.push_str(&osc8(&dest_url));
+                link_hot = valid_link_url(&dest_url);
+                if link_hot {
+                    inline.push_str(&osc8(&dest_url));
+                }
                 inline.push_str(UNDERLINE_ON);
                 inline.push_str("▧ ");
                 image_mark = Some(inline.len());
@@ -882,7 +903,9 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                     inline.push_str("image");
                 }
                 inline.push_str(UNDERLINE_OFF);
-                inline.push_str(OSC8_CLOSE);
+                if link_hot {
+                    inline.push_str(OSC8_CLOSE);
+                }
             }
             Event::Code(text) => inline.push_str(&theme.fg("mdCode", &text)),
             Event::Text(text) => {

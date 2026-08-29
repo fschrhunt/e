@@ -8,6 +8,36 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- A functionality pass inheriting the reference design's behavior — all of
+  it except the sandbox/permission layer, which e deliberately does not
+  have (tools keep running without prompts; see the safety model):
+  - The `ask` tool: the model can ask one question and wait. A footer
+    question panel offers numbered options (digits answer in one stroke),
+    ↑↓ selection, a freeform typed slot, and Esc to dismiss — a dismissal
+    reads back to the model as a cancelled call, and Esc on the panel does
+    not abort the turn. Available in read-only mode too.
+  - Real diffs in the detail viewer: edits and writes render line numbers
+    against the file as it exists now, three context lines, `⋯` elision
+    between hunks, and the diff-marker green/red on the number-and-sign
+    column — the changed text itself stays neutral. Behind ctrl+o.
+  - Faithful resume: consecutive silent tool batches replay as the one
+    growing tree they were live; restored groups seal, so a recorded call
+    whose result never came renders an explicit "Tool completion was not
+    reported" row and an `unreported` tally instead of silently vanishing
+    under a header that counts it; recorded tool results come back to the
+    ctrl+o viewer; and a live batch after a resume starts its own tree
+    instead of splicing into a restored one.
+  - The composer caps at half the frame plus one row: a longer draft
+    scrolls behind a cursor-following window whose first row wears `┃↑`.
+    Pastes collapse to a placeholder only past a thousand codepoints, the
+    reference threshold — short multiline pastes insert literally.
+  - Filtered picker rows brighten the chars the query matched, so a fuzzy
+    hit shows why it matched. `/help` opens the commands picker itself
+    (browse, filter, Enter to use) instead of printing a wall of text.
+  - Link URLs are validated before entering an OSC 8 sequence — control
+    bytes or an oversized URL render as plain text instead of corrupting
+    the terminal's escape stream.
+
 - A full visual-parity pass against the current reference design (fx). The
   look moves to the reference's own literals across every surface:
   - Code fences drop the box frame for the reference's dim horizontal rules
