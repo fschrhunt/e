@@ -8,15 +8,15 @@
 //!   Commands 7 · Type to filter          1–7
 //!
 //!     /login   sign in to a provider
-//!     /model   list or switch models       ← selected row bold, no caret
+//!     /model   list or switch models       ← selected row filled, no caret
 //!   ── divider ─────────────────────────────
 //!   ↑↓ Navigate     Enter Use     Esc Close   (rides the status row)
 //! ```
 //!
-//! Selection is bold-ink vs default — no caret glyph, the reference
-//! convention. The band is a fixed height: it always shows MAX_VISIBLE
-//! selectable rows, padded blank below a short match list, so the box never
-//! grows or shrinks while typing a filter.
+//! Selection splits by surface — the model pickers brighten (bold ink), the
+//! rest fill the row (`selectedBg` behind `selectedText`); unselected rows
+//! stay dim, no caret either way. The band holds only its rows: at most
+//! MAX_VISIBLE, shrinking with a short match list instead of blank-padding.
 
 use crate::tui::markdown::visible_width;
 use crate::tui::render::bold;
@@ -192,38 +192,64 @@ impl Menu {
         }
     }
 
+    /// What an empty result set says, in the reference's own words per
+    /// surface.
+    fn empty_notice(&self) -> &'static str {
+        match self.kind {
+            MenuKind::Commands => "no matching slash commands",
+            MenuKind::Files => "no matching files",
+            MenuKind::Skills => "No skills found.",
+            _ => "Nothing found.",
+        }
+    }
+
+    /// The selected row's dress. The reference splits its pickers: the model
+    /// surfaces signal by brightness alone, every other picker fills the row
+    /// — selection background, selection ink.
+    fn selected_style(&self, theme: &Theme, text: &str) -> String {
+        match self.kind {
+            MenuKind::Models | MenuKind::Scoped => bold(&theme.fg("userMessageText", text)),
+            _ => {
+                let bg = theme.bg_prefix("selectedBg");
+                let fg = theme.fg_prefix("selectedText");
+                if bg.is_empty() && fg.is_empty() {
+                    bold(&theme.fg("userMessageText", text))
+                } else {
+                    format!("{bg}{fg}{text}\x1b[0m")
+                }
+            }
+        }
+    }
+
     pub fn render(&self, theme: &Theme, width: usize) -> Vec<String> {
         let count = self.filtered.len();
         let window_end = (self.window_start + MAX_VISIBLE).min(count);
 
-        let mut header = format!(
-            "{}{}",
-            bold(&theme.fg("userMessageText", self.title)),
-            theme.fg(
-                "muted",
-                &if self.query.is_empty() {
-                    format!(" {count} · Type to filter")
-                } else {
-                    format!(" {count} · {}", self.query)
-                }
-            ),
-        );
+        // The reference header is uniformly dim — `Commands 7 · Type to
+        // filter` before the first keystroke, the bare noun and count once a
+        // filter is live (the composer already shows the typed query).
+        let mut header_plain = if self.query.is_empty() {
+            format!("{} {count} · Type to filter", self.title)
+        } else {
+            format!("{} {count}", self.title)
+        };
         if count > MAX_VISIBLE {
+            // Scroll range, right-aligned with the reference's one-column
+            // margin.
             let range = format!("{}–{}", self.window_start + 1, window_end);
-            let pad = width.saturating_sub(visible_width(&header) + range.chars().count());
+            let pad =
+                width.saturating_sub(1 + visible_width(&header_plain) + range.chars().count());
             if pad > 1 {
-                header.push_str(&" ".repeat(pad));
-                header.push_str(&theme.fg("muted", &range));
+                header_plain.push_str(&" ".repeat(pad));
+                header_plain.push_str(&range);
             }
         }
+        let header = theme.fg("dim", &header_plain);
 
         let mut body: Vec<String> = Vec::new();
         if count == 0 {
-            body.push(theme.fg("muted", "  Nothing found."));
+            body.push(theme.fg("dim", &format!("  {}", self.empty_notice())));
         }
-        // Reference treatment: selection is brightness alone — the selected
-        // row's label is bold bright ink, every other row is dim entirely;
-        // descriptions are always dim; three-space column gap.
         let label_width = self.filtered[self.window_start..window_end]
             .iter()
             .map(|&i| visible_width(&self.items[i].label))
@@ -233,43 +259,63 @@ impl Menu {
         for slot in self.window_start..window_end {
             let item = &self.items[self.filtered[slot]];
             let selected = slot == self.selected;
-            let padded = format!(
+            // One plain row — label column, three-space gap, description,
+            // right-aligned metadata — styled as a whole: the selected dress
+            // or dim, never mixed runs.
+            let mut content = format!(
                 "{}{}",
                 item.label,
                 " ".repeat(label_width.saturating_sub(visible_width(&item.label)))
             );
-            let mut row = if selected {
-                bold(&theme.fg("userMessageText", &padded))
-            } else {
-                theme.fg("dim", &padded)
-            };
             if !item.description.is_empty() {
-                row.push_str(&theme.fg("dim", &format!("   {}", item.description)));
+                content.push_str("   ");
+                content.push_str(&item.description);
             }
             if !item.meta.is_empty() {
-                let pad = width.saturating_sub(2 + visible_width(&row) + visible_width(&item.meta));
+                let pad = width
+                    .saturating_sub(1 + 2 + visible_width(&content) + visible_width(&item.meta));
                 if pad > 3 {
-                    row.push_str(&" ".repeat(pad));
-                    row.push_str(&theme.fg("dim", &item.meta));
+                    content.push_str(&" ".repeat(pad));
+                    content.push_str(&item.meta);
                 }
             }
-            let mut line = format!("  {row}");
-            if visible_width(&line) > width {
-                line = line
-                    .chars()
-                    .take(width.saturating_sub(1))
-                    .collect::<String>()
-                    + "…";
-            }
-            body.push(line);
+            let styled = if selected {
+                self.selected_style(theme, &content)
+            } else {
+                theme.fg("dim", &content)
+            };
+            // Escape-aware clipping: SGR runs are zero columns and a cut row
+            // closes its styles instead of severing a sequence mid-run.
+            body.push(crate::tui::markdown::clip_styled(
+                &format!("  {styled}"),
+                width,
+            ));
         }
-        // Fixed band height: blank rows below a short match list, so the
-        // box holds the same size at first keystroke and after filtering.
-        while body.len() < MAX_VISIBLE {
-            body.push(String::new());
-        }
+        // The band holds only its rows — the reference never blank-pads a
+        // short match list.
         crate::tui::panel::frame(theme, width, header, body)
     }
+}
+
+/// Pick the widest hint variant that fits — the reference degrades its nav
+/// hints stepwise instead of clipping them.
+pub fn degrade_hint(hint: &'static str, width: usize) -> &'static str {
+    let variants: &[&'static str] = if hint == HINT_USE {
+        &[
+            HINT_USE,
+            "↑↓ Navigate  Enter Use  Esc Close",
+            "↑↓ Move  Enter  Esc",
+            "Enter Use  Esc Close",
+            "Enter Esc",
+        ]
+    } else {
+        return hint;
+    };
+    variants
+        .iter()
+        .copied()
+        .find(|v| v.chars().count() <= width)
+        .unwrap_or(variants[variants.len() - 1])
 }
 
 #[cfg(test)]

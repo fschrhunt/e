@@ -8,6 +8,7 @@ use crate::core::tools::ToolOutcome;
 use crate::tui::markdown::{render_markdown, wrap_styled};
 use crate::tui::render::{bold, dim};
 use crate::tui::theme::Theme;
+use unicode_width::UnicodeWidthChar;
 
 /// One stable child of a provider-issued tool batch.
 pub struct ToolChild {
@@ -194,16 +195,17 @@ impl Block {
 
     fn refresh_tool_header(&mut self) {
         let mut counts: Vec<(String, usize)> = Vec::new();
+        let mut timed_out = 0usize;
         let mut failed = 0usize;
+        let mut denied = 0usize;
         let mut cancelled = 0usize;
         for child in &self.tool_children {
-            if matches!(
-                child.state,
-                ToolState::Failed | ToolState::TimedOut | ToolState::Blocked
-            ) {
-                failed += 1;
-            } else if child.state == ToolState::Cancelled {
-                cancelled += 1;
+            match child.state {
+                ToolState::TimedOut => timed_out += 1,
+                ToolState::Failed => failed += 1,
+                ToolState::Blocked => denied += 1,
+                ToolState::Cancelled => cancelled += 1,
+                _ => {}
             }
             if let Some((_, count)) = counts.iter_mut().find(|(kind, _)| *kind == child.category) {
                 *count += 1;
@@ -211,16 +213,24 @@ impl Block {
                 counts.push((child.category.clone(), 1));
             }
         }
+        // The reference orders category tallies by descending count (a stable
+        // sort keeps first-seen order for ties), then the outcome tallies in
+        // its fixed grammar: timed out · failed · denied · cancelled.
+        counts.sort_by_key(|a| std::cmp::Reverse(a.1));
         let count = self.tool_children.len();
         let mut header = format!("{count} tool call{}", if count == 1 { "" } else { "s" });
         for (category, count) in counts {
             header.push_str(&format!(" · {}", category_tally(&category, count)));
         }
-        if failed > 0 {
-            header.push_str(&format!(" · {failed} failed"));
-        }
-        if cancelled > 0 {
-            header.push_str(&format!(" · {cancelled} cancelled"));
+        for (count, label) in [
+            (timed_out, "timed out"),
+            (failed, "failed"),
+            (denied, "denied"),
+            (cancelled, "cancelled"),
+        ] {
+            if count > 0 {
+                header.push_str(&format!(" · {count} {label}"));
+            }
         }
         self.text = header;
     }
@@ -252,11 +262,13 @@ impl Block {
 
     fn render(&self, theme: &Theme, width: usize, blink_on: bool) -> Vec<String> {
         match self.kind {
-            // `𝑒 dogfood · Run /help for commands` — name bold, rest dim.
+            // `𝑒 dogfood · Run /help for commands` — name bold ink, the rest
+            // in the reference's dim (247 on light, one step lighter than the
+            // statusline gray).
             Kind::Banner => vec![format!(
                 "{}{}",
                 bold(&theme.fg("userMessageText", "𝑒")),
-                theme.fg("muted", &format!(" {} · Run /help for commands", self.text))
+                theme.fg("dim", &format!(" {} · Run /help for commands", self.text))
             )],
             Kind::User => {
                 let rail = format!("{} ", theme.fg("userMessageText", "┃"));
@@ -299,7 +311,9 @@ impl Block {
             Kind::Tool => {
                 // The reference shape: a finished row is just the row — no
                 // "(done)". Failure turns the marker to the error token and
-                // adds a `│ <outcome>` continuation beneath.
+                // adds a `│ <outcome>` continuation beneath. A finished row's
+                // `●` wears the system-notice text gray; a cancelled row
+                // brightens its summary and asks what to do differently.
                 let marker = if self.cancelled {
                     theme.fg("warning", "■")
                 } else if !self.done {
@@ -307,53 +321,55 @@ impl Block {
                 } else if self.is_error {
                     theme.fg("error", "●")
                 } else {
-                    "●".to_string()
+                    theme.fg("customMessageText", "●")
                 };
-                let mut rows = vec![match &self.detail {
-                    Some(target) if !target.is_empty() => {
-                        format!("{marker} {} {}", self.text, theme.fg("muted", target))
+                let mut rows = vec![if self.cancelled {
+                    let plain = match &self.detail {
+                        Some(target) if !target.is_empty() => {
+                            format!("{} {}", self.text, target)
+                        }
+                        _ => self.text.clone(),
+                    };
+                    format!(
+                        "{marker} {} · What can e do differently?",
+                        theme.fg("userMessageText", &plain)
+                    )
+                } else {
+                    match &self.detail {
+                        Some(target) if !target.is_empty() => {
+                            format!("{marker} {} {}", self.text, theme.fg("muted", target))
+                        }
+                        _ => format!("{marker} {}", self.text),
                     }
-                    _ => format!("{marker} {}", self.text),
                 }];
                 if self.done {
                     // The reference's command-output shape: the first lines
-                    // as `│` rows, an elision row for the rest, and an exit
-                    // line ("│ exit code 7") when the command failed.
+                    // as `│` rows, an exit line ("│ exit code 7") when the
+                    // command failed, and an elision row for the rest.
                     for line in &self.preview {
-                        rows.push(theme.fg("muted", &format!("│ {line}")));
+                        rows.push(theme.fg("dim", &format!("│ {line}")));
                     }
                     if self.is_error {
                         if let Some(result) = &self.result {
-                            let shown = display_outcome(result);
-                            rows.push(theme.fg("muted", &format!("│ {shown}")));
+                            let shown =
+                                clip_plain(&display_outcome(result), width.saturating_sub(2));
+                            rows.push(theme.fg("dim", &format!("│ {shown}")));
                         }
                     }
                     if self.more > 0 {
-                        rows.push(theme.fg(
-                            "muted",
-                            &format!("│ … {} lines more (ctrl o to view)", self.more),
-                        ));
+                        rows.push(theme.fg("dim", &elision_row(self.more, width)));
                     }
                 }
                 rows
             }
             Kind::ToolGroup => {
                 // The reference grammar runs the tool family flush left — the
-                // same column as the user rail — never indented.
-                let marker = bold(&theme.fg("userMessageText", "●"));
-                let mut rows = vec![format!("{marker} {}", theme.fg("statusline", &self.text))];
-                const MAX_TREE_ROWS: usize = 8;
-                let overflow = self.tool_children.len().saturating_sub(MAX_TREE_ROWS - 1);
-                // The most recent calls keep their rows — that is where the
-                // live activity is — and the earliest ones fold into a
-                // count above them. The header carries the full tallies.
-                if overflow > 0 {
-                    rows.push(format!(
-                        "{} {}",
-                        theme.fg("muted", "├"),
-                        theme.fg("muted", &format!("… {overflow} earlier tool calls"))
-                    ));
-                }
+                // same column as the user rail — never indented. The header's
+                // `●` wears the prompt-rail ink, unbolded, and the tallies the
+                // statusline gray, clipped to the frame.
+                let marker = theme.fg("userMessageText", "●");
+                let header = clip_plain(&self.text, width.saturating_sub(2));
+                let mut rows = vec![format!("{marker} {}", theme.fg("muted", &header))];
                 if self.tool_children.is_empty() {
                     for (i, child) in self.children.iter().enumerate() {
                         let connector = if i + 1 == self.children.len() {
@@ -361,15 +377,19 @@ impl Block {
                         } else {
                             "├"
                         };
-                        rows.push(format!("{connector} {}", theme.fg("statusline", child)));
+                        rows.push(format!(
+                            "{} {}",
+                            theme.fg("muted", connector),
+                            theme.fg("muted", child)
+                        ));
                     }
                     return rows;
                 }
-                for (index, child) in self.tool_children.iter().skip(overflow).enumerate() {
+                for (index, child) in self.tool_children.iter().enumerate() {
                     if child.state == ToolState::Pending {
                         continue;
                     }
-                    let last = index + overflow + 1 == self.tool_children.len();
+                    let last = index + 1 == self.tool_children.len();
                     let connector = if last { "└" } else { "├" };
                     let connector = match child.state {
                         ToolState::Running if blink_on => theme.fg("userMessageText", connector),
@@ -380,12 +400,17 @@ impl Block {
                         ToolState::Cancelled => theme.fg("warning", connector),
                         _ => theme.fg("muted", connector),
                     };
+                    // The reference keeps a non-zero exit on the `Ran` row —
+                    // the header tally says `failed`, the row says what ran.
                     let action = match child.state {
                         ToolState::Running => child.running.as_str(),
                         ToolState::Completed => child.completed.as_str(),
+                        ToolState::Failed if child.category == "command" => {
+                            child.completed.as_str()
+                        }
                         ToolState::Failed => "Failed",
                         ToolState::TimedOut => "Timed out",
-                        ToolState::Blocked => "Blocked",
+                        ToolState::Blocked => "Denied",
                         ToolState::Cancelled => "Cancelled",
                         ToolState::Pending => unreachable!(),
                     };
@@ -395,21 +420,21 @@ impl Block {
                         child
                             .result
                             .as_deref()
-                            .map(|result| format!("  {result}"))
+                            .map(|result| diff_stat_suffix(theme, result))
                             .unwrap_or_default()
                     } else {
                         String::new()
                     };
-                    let available =
-                        width.saturating_sub(2 + action.chars().count() + suffix.chars().count());
+                    let suffix_width: usize = suffix_stat_width(&suffix);
+                    let available = width.saturating_sub(2 + display_width(action) + suffix_width);
                     let target = clip_plain(&child.target, available);
                     let label = if target.is_empty() {
-                        format!("{action}{suffix}")
+                        action.to_string()
                     } else {
-                        format!("{action} {target}{suffix}")
+                        format!("{action} {target}")
                     };
-                    rows.push(format!("{connector} {}", theme.fg("statusline", &label)));
-                    append_tool_preview(&mut rows, child, theme);
+                    rows.push(format!("{connector} {}{suffix}", theme.fg("muted", &label)));
+                    append_tool_preview(&mut rows, child, theme, width);
                 }
                 rows
             }
@@ -437,11 +462,18 @@ impl Block {
                 .into_iter()
                 .map(|l| format!("  {l}"))
                 .collect(),
-            Kind::Error => wrap_styled(&self.text, width.saturating_sub(2).max(8))
-                .into_iter()
-                .map(|l| theme.fg("error", &format!("  {l}")))
-                .collect(),
-            Kind::System => vec![theme.fg("dim", &format!("● System: {}", self.text))],
+            // The reference notice grammar: `● Topic: body` — the marker and
+            // label in the tone's style (red for an error), the body in the
+            // system-notice text gray, continuations indented two columns.
+            Kind::Error => notice_rows(theme, "error", false, "Error", &self.text, width),
+            Kind::System => notice_rows(
+                theme,
+                "customMessageLabel",
+                true,
+                "System",
+                &self.text,
+                width,
+            ),
         }
     }
 }
@@ -461,8 +493,32 @@ fn display_outcome(result: &str) -> String {
     }
 }
 
+/// Visible cell width of plain text (no SGR).
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// The width-1 prefix of `text` by display cells.
+fn prefix_by_width(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out
+}
+
+/// Clip by display cells the reference way: fits → unchanged; one cell →
+/// a bare ellipsis; otherwise a width-1 prefix plus `…`.
 fn clip_plain(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
+    if display_width(text) <= width {
         return text.to_string();
     }
     if width == 0 {
@@ -471,9 +527,106 @@ fn clip_plain(text: &str, width: usize) -> String {
     if width == 1 {
         return "…".into();
     }
-    let mut clipped: String = text.chars().take(width - 1).collect();
+    let mut clipped = prefix_by_width(text, width - 1);
     clipped.push('…');
     clipped
+}
+
+/// The command-output elision row, degrading with the frame the reference
+/// way: full wording, then `(ctrl o)`, then the bare count, then a hard
+/// prefix clip.
+fn elision_row(more: usize, width: usize) -> String {
+    let noun = if more == 1 { "line" } else { "lines" };
+    let candidates = [
+        format!("│ … {more} {noun} more (ctrl o to view)"),
+        format!("│ … {more} more (ctrl o)"),
+        format!("│ … {more} more"),
+    ];
+    for candidate in &candidates {
+        if display_width(candidate) <= width {
+            return candidate.clone();
+        }
+    }
+    prefix_by_width(&candidates[candidates.len() - 1], width)
+}
+
+/// `● Topic: body` in the reference notice grammar: the marker and label in
+/// the tone's token (bold for the information tone), the body in the
+/// system-notice text gray, continuations indented two columns.
+fn notice_rows(
+    theme: &Theme,
+    tone: &str,
+    bold_label: bool,
+    topic: &str,
+    body: &str,
+    width: usize,
+) -> Vec<String> {
+    let plain = format!("● {topic}:");
+    let label = if bold_label {
+        bold(&theme.fg(tone, &plain))
+    } else {
+        theme.fg(tone, &plain)
+    };
+    let body_width = width.saturating_sub(2).max(8);
+    let mut rows = Vec::new();
+    for line in wrap_styled(body, body_width) {
+        if rows.is_empty() {
+            rows.push(format!("{label} {}", theme.fg("customMessageText", &line)));
+        } else {
+            rows.push(format!("  {}", theme.fg("customMessageText", &line)));
+        }
+    }
+    if rows.is_empty() {
+        rows.push(label);
+    }
+    rows
+}
+
+/// The reference's edit/write stat suffix: ` +N / -M` with the diff-marker
+/// hue on each count and a dim slash; one-sided edits drop the slash, and a
+/// summary that isn't a `+N -M` pair rides muted unchanged.
+fn diff_stat_suffix(theme: &Theme, result: &str) -> String {
+    let mut adds = None;
+    let mut dels = None;
+    for part in result.split_whitespace() {
+        if let Some(n) = part.strip_prefix('+').and_then(|v| v.parse::<usize>().ok()) {
+            adds = Some(n);
+        } else if let Some(n) = part.strip_prefix('-').and_then(|v| v.parse::<usize>().ok()) {
+            dels = Some(n);
+        }
+    }
+    let add_token = Theme::diff_marker_token(true);
+    let del_token = Theme::diff_marker_token(false);
+    match (adds, dels) {
+        (Some(a), Some(d)) if a > 0 && d > 0 => format!(
+            " {} {} {}",
+            theme.fg(add_token, &format!("+{a}")),
+            theme.fg("dim", "/"),
+            theme.fg(del_token, &format!("-{d}"))
+        ),
+        (Some(a), _) if a > 0 => format!(" {}", theme.fg(add_token, &format!("+{a}"))),
+        (_, Some(d)) if d > 0 => format!(" {}", theme.fg(del_token, &format!("-{d}"))),
+        (Some(_), Some(_)) => String::new(),
+        _ => format!(" {}", theme.fg("muted", result)),
+    }
+}
+
+/// Visible width of a styled suffix (SGR stripped).
+fn suffix_stat_width(suffix: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = suffix.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    width
 }
 
 /// Pipe rows appear only while the command owns execution focus — the
@@ -481,7 +634,7 @@ fn clip_plain(text: &str, width: usize) -> String {
 /// ctrl+o, never inline. Live rows are a shell thing: a write or edit shows
 /// in the tree as its one action row, never as the file's content streaming
 /// beneath it.
-fn append_tool_preview(rows: &mut Vec<String>, child: &ToolChild, theme: &Theme) {
+fn append_tool_preview(rows: &mut Vec<String>, child: &ToolChild, theme: &Theme, width: usize) {
     if child.state != ToolState::Running {
         return;
     }
@@ -494,19 +647,14 @@ fn append_tool_preview(rows: &mut Vec<String>, child: &ToolChild, theme: &Theme)
         .filter(|line| !line.starts_with("… [killed:") && *line != "… [cancelled]")
         .collect();
     const LIVE_BUDGET: usize = 5;
+    // The reference frames every output row in the dim gray, gutter and
+    // content together — output carries no hue of its own.
     for line in output.iter().take(LIVE_BUDGET) {
-        let styled = if line.starts_with('+') && !line.starts_with("+++") {
-            theme.fg("toolDiffAdded", line)
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            theme.fg("toolDiffRemoved", line)
-        } else {
-            theme.fg("muted", line)
-        };
-        rows.push(format!("{} {styled}", theme.fg("muted", "│")));
+        rows.push(theme.fg("dim", &format!("│ {line}")));
     }
     let more = output.len().saturating_sub(LIVE_BUDGET);
     if more > 0 {
-        rows.push(theme.fg("muted", &format!("│ … {more} lines more (ctrl o to view)")));
+        rows.push(theme.fg("dim", &elision_row(more, width)));
     }
 }
 
@@ -563,7 +711,7 @@ fn tally_label(verb: &str, count: usize) -> String {
         "Wrote" => "write",
         "Edited" => "edit",
         "Ran" | "Running" => "command",
-        "Searched" => "search",
+        "Searched" => "read",
         "Listed" => "list",
         other => return format!("{count} {}", other.to_lowercase()),
     };

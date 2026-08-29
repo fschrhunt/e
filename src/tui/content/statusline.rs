@@ -1,9 +1,10 @@
 //! Activity row and status line — pure projections of app state.
 
-use crate::core::output::{compact_model_label, format_tokens};
+use crate::core::output::compact_model_label;
 use crate::core::providers::FailureCause;
 use crate::tui::markdown::visible_width;
 use crate::tui::theme::Theme;
+use unicode_width::UnicodeWidthChar;
 
 /// How long a "recovered" flash stays up before reverting to normal turn
 /// activity — matches the reference client's brief, self-clearing confirm.
@@ -139,13 +140,30 @@ impl Turn {
         if self.input == 0 && output == 0 {
             String::new()
         } else {
+            // The reference prints raw counts — `(↑10 ↓20)` — never a
+            // compacted `1k`. The `~` marks a chars/4 seed the reference
+            // doesn't have; it clears once real usage lands.
             let estimate = if self.input_estimated { "~" } else { "" };
-            format!(
-                "(↑{estimate}{} ↓{})",
-                format_tokens(self.input),
-                format_tokens(output)
-            )
+            format!("(↑{estimate}{} ↓{output})", self.input)
         }
+    }
+
+    /// The Thinking label split at the token suffix, so the paint layer can
+    /// tone the verb and the `(↑… ↓…)` tail separately the reference way.
+    pub fn label_parts(&self, elapsed_secs: u64) -> Option<(String, String)> {
+        if self.recovered.is_some() || self.phase != TurnPhase::Thinking {
+            return None;
+        }
+        let tokens = self.tokens();
+        let suffix = if tokens.is_empty() {
+            String::new()
+        } else {
+            format!(" {tokens}")
+        };
+        Some((
+            format!("Thinking ({})", format_elapsed(elapsed_secs)),
+            suffix,
+        ))
     }
 
     /// The tool phase renders inside its transcript group, not in a duplicate
@@ -157,16 +175,8 @@ impl Turn {
         }
         match self.phase {
             TurnPhase::Thinking => {
-                let tokens = self.tokens();
-                let suffix = if tokens.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {tokens}")
-                };
-                Some(format!(
-                    "Thinking ({}){suffix}",
-                    format_elapsed(elapsed_secs)
-                ))
+                let (main, suffix) = self.label_parts(elapsed_secs)?;
+                Some(format!("{main}{suffix}"))
             }
             TurnPhase::Retrying => {
                 let r = self.retry.as_ref()?;
@@ -205,27 +215,106 @@ pub struct StatusData {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub session_name: Option<String>,
-    /// Context used, as a percent. Hidden until it rounds to at least 1.
-    pub context_percent: Option<u8>,
+    /// Estimated tokens of the current context and the model's window, for
+    /// the reference's `Context: 12k/200k 6%` segment.
+    pub context_used: u64,
+    pub context_total: Option<u64>,
     pub queued: usize,
+    /// A turn is streaming — the reference says `enter queue`.
+    pub streaming: bool,
+    /// The workspace tail (`~`-relative) and git branch for the trailing
+    /// identity segment.
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
 }
 
-/// The bottom row: blank spacer, then dot-joined segments; the leading one
-/// brighter. A transient overlay (armed-exit, menu hints) replaces the right
-/// or the whole row.
+/// The reference caps the session title at 32 cells.
+const MAX_SESSION_TITLE_CELLS: usize = 32;
+
+fn prefix_by_cells(text: &str, cells: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > cells {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+fn suffix_by_cells(text: &str, cells: usize) -> String {
+    let total: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= cells {
+        return text.to_string();
+    }
+    let mut skip = total.saturating_sub(cells);
+    let mut out = String::new();
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if skip > 0 {
+            skip = skip.saturating_sub(w);
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The trailing `path (branch)` identity, budgeted the reference way: the
+/// branch appears only when at least seven cells are free, takes at most
+/// half the budget (floor four), and each side clips toward what matters —
+/// the path keeps its tail, the branch its head.
+fn workspace_identity(workspace: &str, branch: Option<&str>, budget: usize) -> Option<String> {
+    if workspace.is_empty() || budget == 0 {
+        return None;
+    }
+    if let Some(branch) = branch.filter(|b| !b.is_empty()) {
+        if budget >= 7 {
+            let branch_width: usize = branch.chars().map(|c| c.width().unwrap_or(0)).sum();
+            let branch_budget = branch_width.min((budget - 4).min(4usize.max(budget / 2)));
+            let path_budget = budget - 3 - branch_budget;
+            return Some(format!(
+                "{} ({})",
+                suffix_by_cells(workspace, path_budget),
+                prefix_by_cells(branch, branch_budget)
+            ));
+        }
+    }
+    Some(suffix_by_cells(workspace, budget))
+}
+
+/// The bottom row: dot-joined segments in the statusline gray — the
+/// reference tones the whole row alike. With no panel open a blank spacer
+/// rides above (the reference paints its bottom-divider row blank there);
+/// an open panel's own divider sits directly above the row instead. A
+/// transient overlay (armed-exit) rides right-aligned; a menu hint replaces
+/// the row in dim.
 pub fn statusline(
     theme: &Theme,
     data: &StatusData,
     overlay: Option<&str>,
     hint: Option<&str>,
+    panel_open: bool,
     width: usize,
 ) -> Vec<String> {
+    let lead: &[String] = if panel_open { &[] } else { &[String::new()] };
     if let Some(hint) = hint {
-        return vec![String::new(), theme.fg("muted", hint)];
+        let mut rows = lead.to_vec();
+        rows.push(theme.fg("dim", hint));
+        return rows;
     }
     let mut segments = Vec::new();
+    if data.model.is_none() {
+        segments.push("run /login".to_string());
+    }
     if data.queued > 0 {
         segments.push(format!("queued {}", data.queued));
+    }
+    if data.streaming {
+        segments.push("enter queue".to_string());
     }
     if let Some(model) = &data.model {
         segments.push(compact_model_label(model));
@@ -236,21 +325,40 @@ pub fn statusline(
         }
     }
     if let Some(n) = &data.session_name {
-        segments.push(n.clone());
+        segments.push(prefix_by_cells(n, MAX_SESSION_TITLE_CELLS));
     }
-    if let Some(p) = data.context_percent {
-        if p >= 1 {
-            segments.push(format!("{p}%"));
+    if data.context_used > 0 {
+        segments.push(match data.context_total {
+            Some(total) if total > 0 => format!(
+                "Context: {}k/{}k {}%",
+                data.context_used / 1000,
+                total / 1000,
+                (data.context_used * 100) / total
+            ),
+            _ => format!("Context: {}k", data.context_used / 1000),
+        });
+    }
+    let mut line_plain = segments.join(" · ");
+    if let Some(workspace) = &data.workspace {
+        let used: usize = line_plain.chars().map(|c| c.width().unwrap_or(0)).sum();
+        let sep = if line_plain.is_empty() { 0 } else { 3 };
+        if used + sep < width {
+            if let Some(identity) =
+                workspace_identity(workspace, data.branch.as_deref(), width - used - sep)
+            {
+                if !line_plain.is_empty() {
+                    line_plain.push_str(" · ");
+                }
+                line_plain.push_str(&identity);
+            }
         }
     }
 
-    let mut line = String::new();
-    if let Some((head, rest)) = segments.split_first() {
-        line = theme.fg("accent", head);
-        if !rest.is_empty() {
-            line.push_str(&theme.fg("muted", &format!(" · {}", rest.join(" · "))));
-        }
-    }
+    let mut line = if line_plain.is_empty() {
+        String::new()
+    } else {
+        theme.fg("muted", &line_plain)
+    };
     if let Some(overlay) = overlay {
         let used = visible_width(&line);
         let pad = width.saturating_sub(used + overlay.chars().count());
@@ -261,7 +369,9 @@ pub fn statusline(
             line = theme.fg("muted", overlay);
         }
     }
-    vec![String::new(), line]
+    let mut rows = lead.to_vec();
+    rows.push(line);
+    rows
 }
 
 #[cfg(test)]
@@ -280,18 +390,20 @@ mod tests {
         turn.input = 1_000;
         turn.output = 20;
         turn.phase = TurnPhase::AssistantText;
-        assert_eq!(turn.label(2).as_deref(), Some("(↑1k ↓20)"));
+        assert_eq!(turn.label(2).as_deref(), Some("(↑1000 ↓20)"));
 
         turn.phase = TurnPhase::Thinking;
-        assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1k ↓20)"));
+        assert_eq!(turn.label(3).as_deref(), Some("Thinking (3s) (↑1000 ↓20)"));
     }
 
     #[test]
     fn elapsed_switches_to_minutes_above_a_minute() {
+        // The reference grammar: no separators, no zero padding.
         assert_eq!(format_elapsed(59), "59s");
-        assert_eq!(format_elapsed(60), "1m 00s");
-        assert_eq!(format_elapsed(636), "10m 36s");
-        assert_eq!(format_elapsed(3_725), "1h 02m");
+        assert_eq!(format_elapsed(60), "1m0s");
+        assert_eq!(format_elapsed(636), "10m36s");
+        assert_eq!(format_elapsed(1_080), "18m0s");
+        assert_eq!(format_elapsed(3_663), "1h1m3s");
     }
 
     #[test]
@@ -299,9 +411,10 @@ mod tests {
         let mut turn = Turn::new();
         turn.input = 39_000;
         turn.output = 20_000;
+        // The reference prints raw token counts, never a compacted `39k`.
         assert_eq!(
             turn.label(636).as_deref(),
-            Some("Thinking (10m 36s) (↑39k ↓20k)")
+            Some("Thinking (10m36s) (↑39000 ↓20000)")
         );
     }
 
@@ -312,35 +425,35 @@ mod tests {
         turn.note_assembly(8_000); // ~2k tokens of argument JSON so far
         assert_eq!(
             turn.label(7).as_deref(),
-            Some("Thinking (7s) (↑50k ↓2.2k)"),
+            Some("Thinking (7s) (↑50000 ↓2200)"),
             "argument streaming stays in the Thinking phase — the tool row, not the footer, owns the activity"
         );
         // The next cumulative report ticks the same counter.
         turn.note_assembly(12_000);
-        assert_eq!(turn.tokens(), "(↑50k ↓3.2k)");
+        assert_eq!(turn.tokens(), "(↑50000 ↓3200)");
     }
 
     #[test]
     fn usage_resets_the_streaming_estimate() {
         let mut turn = Turn::new();
         turn.note_text(&"x".repeat(4_000)); // ~1k estimated
-        assert_eq!(turn.tokens(), "(↑0 ↓1k)");
+        assert_eq!(turn.tokens(), "(↑0 ↓1000)");
         // Real usage lands: the estimate must not double what is now
         // counted for real.
         turn.note_usage(9_000, 800);
-        assert_eq!(turn.tokens(), "(↑9k ↓800)");
+        assert_eq!(turn.tokens(), "(↑9000 ↓800)");
         // The next step's streaming adds on top of the real total.
         turn.note_text("abcd");
-        assert_eq!(turn.tokens(), "(↑9k ↓801)");
+        assert_eq!(turn.tokens(), "(↑9000 ↓801)");
     }
 
     #[test]
     fn seeded_input_is_visibly_an_estimate() {
         let mut turn = Turn::new();
         turn.seed_input(5_208_000);
-        assert_eq!(turn.tokens(), "(↑~5208k ↓0)");
+        assert_eq!(turn.tokens(), "(↑~5208000 ↓0)");
         turn.note_usage(10_000, 2);
-        assert_eq!(turn.tokens(), "(↑10k ↓2)");
+        assert_eq!(turn.tokens(), "(↑10000 ↓2)");
     }
 
     #[test]

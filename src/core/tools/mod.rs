@@ -218,7 +218,8 @@ static SPECS: &[Spec] = &[
     Spec {
         name: "grep",
         snippet: "Search file contents by regular expression across the workspace.",
-        category: "search",
+        // The reference tallies a grep under `read` — searching is reading.
+        category: "read",
         running: "Searching",
         completed: "Searched",
         target: target_pattern,

@@ -300,10 +300,29 @@ impl App {
             rows.push(String::new());
         }
         rows.push(self.theme.fg(
-            "statusline",
+            "muted",
             "Full detail · ←/→ switch · ↑↓/pgup·pgdn scroll · ctrl o close · Esc close",
         ));
         rows
+    }
+
+    /// The workspace's current git branch, from `.git/HEAD` — a plain file
+    /// read, no subprocess, absent outside a repository or on a detached
+    /// HEAD. Follows one `gitdir:` indirection for worktrees.
+    fn git_branch(cwd: &std::path::Path) -> Option<String> {
+        let mut git_dir = cwd.join(".git");
+        if git_dir.is_file() {
+            let pointer = std::fs::read_to_string(&git_dir).ok()?;
+            let target = pointer.strip_prefix("gitdir:")?.trim();
+            git_dir = if std::path::Path::new(target).is_absolute() {
+                std::path::PathBuf::from(target)
+            } else {
+                cwd.join(target)
+            };
+        }
+        let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let name = head.trim().strip_prefix("ref: refs/heads/")?;
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     fn frame(&mut self, width: usize) -> Vec<String> {
@@ -332,13 +351,23 @@ impl App {
                     // The reference runs the activity dot on the same column
                     // as the user rail — flush left, no indent. The blink is
                     // presence, not color: the dot shows and hides, no dim
-                    // half-state between.
-                    let line = if blink_on {
-                        format!("{} {label}", self.theme.fg("userMessageText", "•"))
+                    // half-state between. Dot, verb, and elapsed wear the
+                    // accent; the token tail drops to dim.
+                    let (main, tokens) = s
+                        .turn
+                        .label_parts(s.started.elapsed().as_secs())
+                        .unwrap_or((label, String::new()));
+                    let head = if blink_on {
+                        self.theme.fg("accent", &format!("• {main}"))
                     } else {
-                        format!("  {label}")
+                        format!("  {}", self.theme.fg("accent", &main))
                     };
-                    lines.push(line);
+                    let tail = if tokens.is_empty() {
+                        String::new()
+                    } else {
+                        self.theme.fg("dim", &tokens)
+                    };
+                    lines.push(format!("{head}{tail}"));
                 } else {
                     lines.push(label);
                 }
@@ -364,27 +393,48 @@ impl App {
             lines.extend(menu.render(&self.theme, width));
         }
         let window = self.agent.model.context_window.max(1);
-        let percent = ((self.context_tokens.saturating_mul(100)) / window).min(100) as u8;
         // Nothing is signed in for the current model — it's a bootstrap
         // placeholder, not something the user chose, so don't show it.
         let signed_in = self.signed_in;
+        let cwd = self.agent.cwd().to_path_buf();
+        let workspace = {
+            let shown = cwd.to_string_lossy().into_owned();
+            match std::env::var("HOME") {
+                Ok(home) if !home.is_empty() && shown.starts_with(&home) => {
+                    format!("~{}", &shown[home.len()..])
+                }
+                _ => shown,
+            }
+        };
         let data = StatusData {
             model: signed_in.then(|| self.agent.model_slug()),
             effort: signed_in.then(|| self.status_effort.clone()).flatten(),
             session_name: self.agent.session_name(),
-            context_percent: Some(percent),
+            context_used: self.context_tokens,
+            context_total: Some(window),
             queued: self.agent.queued_count() + self.held_prompts.len(),
+            streaming: self.active.is_some(),
+            workspace: Some(workspace),
+            branch: Self::git_branch(&cwd),
         };
         let hint = self
             .settings
             .as_ref()
             .map(|_| crate::tui::settingspanel::HINT)
-            .or_else(|| self.menu.as_ref().map(|m| m.hint));
+            .or_else(|| self.menu.as_ref().map(|m| m.hint))
+            .map(|h| crate::tui::menu::degrade_hint(h, width));
+        // A framed surface's bottom divider sits directly above the hint
+        // row — the blank spacer belongs only to the bare-composer layout.
+        let panel_open = self.trust.is_some()
+            || self.auth.is_some()
+            || self.settings.is_some()
+            || self.menu.is_some();
         lines.extend(statusline(
             &self.theme,
             &data,
             self.overlay.as_deref(),
             hint,
+            panel_open,
             width,
         ));
         lines
@@ -467,14 +517,14 @@ impl App {
     }
 
     /// Rebuild the transcript from a linear message history: clear what's
-    /// showing and replay `messages` as banner-then-blocks, reconstructing
-    /// tool-call groups from their recorded outcomes. Shared by /resume (the
-    /// whole file) and /tree (the path from root to a rewind point) — both
-    /// end up wanting exactly the same replay, just fed a different list.
+    /// showing and replay `messages` as blocks, reconstructing tool-call
+    /// groups from their recorded outcomes. Shared by /resume (the whole
+    /// file) and /tree (the path from root to a rewind point) — both end up
+    /// wanting exactly the same replay, just fed a different list. A resumed
+    /// transcript carries no welcome banner — the reference reserves it for
+    /// a fresh session.
     fn rebuild_transcript(&mut self, messages: &[crate::core::providers::ChatMessage]) {
         self.transcript.clear();
-        self.transcript
-            .push(Block::new(Kind::Banner, crate::VERSION));
         let mut restored_calls = std::collections::HashMap::<String, (usize, u64)>::new();
         let mut restored_id = 0u64;
         for m in messages {
@@ -2059,7 +2109,6 @@ pub async fn run(
                                         &app.agent.history_snapshot(),
                                     );
                                 app.transcript.clear();
-                                app.transcript.push(Block::new(Kind::Banner, crate::VERSION));
                                 app.transcript.push(Block::new(Kind::Notice, "compacted — recent messages kept, the full session is under /resume"));
                                 app.transcript.push(Block::new(Kind::Summary, summary));
                             }

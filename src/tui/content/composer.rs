@@ -351,8 +351,8 @@ impl Editor {
         }
     }
 
-    /// Render the composer band: leading blank, then railed rows with a
-    /// reverse-video cursor cell.
+    /// Render the composer band: the reference's full-width divider above,
+    /// then railed rows with a reverse-video cursor cell.
     pub fn render(&mut self, theme: &Theme, width: usize) -> Vec<String> {
         // A draft starting with `!` is a shell command: the rail turns the
         // bash-mode color — the whole indicator, no words.
@@ -363,9 +363,9 @@ impl Editor {
                 "userMessageText"
             };
         let rail = format!("{} ", theme.fg(rail_token, "┃"));
-        let inner = width.saturating_sub(2).max(8);
+        let inner = width.saturating_sub(2).max(1);
         self.inner_width = Some(inner);
-        let mut out = vec![String::new()];
+        let mut out = vec![theme.fg("border", &"─".repeat(width))];
 
         // Logical lines wrap at word boundaries to `inner`-wide visual rows,
         // every row carrying the rail. The cursor maps to its visual row.

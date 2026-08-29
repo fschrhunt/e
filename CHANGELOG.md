@@ -8,14 +8,48 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- A full visual-parity pass against the current reference design (fx). The
+  look moves to the reference's own literals across every surface:
+  - Code fences drop the box frame for the reference's dim horizontal rules
+    (`─ lang ────`) with flush-left code, a content-inferred label for
+    unlabeled fences, and bare wrapped code below six columns.
+  - The highlighter carries the reference's full language table (25
+    profiles with aliases, block comments, per-language quote sets,
+    case-insensitive SQL/Dockerfile/PowerShell), a distinct literal class in
+    the number gray, and renders unknown languages raw instead of guessing.
+  - Lists keep the author's ordered numbering, dim their markers, and speak
+    task lists (dim `☐`, accent `✓`); blockquotes nest one rail per level;
+    headings no longer lose their style to nested bold or links; tables
+    honor `:---:` alignment with plain separators; bare http(s) URLs
+    autolink; images render as `▧ alt` links.
+  - Wrapping closes and reopens SGR and OSC 8 hyperlinks at every seam,
+    avoids single-word orphan lines, and preserves the author's line breaks
+    instead of reflowing paragraphs.
+  - Tool trees: tallies order by descending count with the reference's
+    outcome grammar (`timed out · failed · denied · cancelled`), a non-zero
+    exit stays on its `Ran` row, the tree never caps its rows, edit/write
+    rows carry the `+N / -M` stat suffix with the diff-marker green/red
+    (truecolor with a 256-color fallback), and command previews wear the dim
+    gutter with width-degrading, pluralized elision wording.
+  - Errors and system rows speak the notice grammar (`● Error: …`,
+    `● System: …`); a cancelled tool row brightens its summary and asks
+    "What can e do differently?"; the welcome banner stays home on a fresh
+    session only (a resumed transcript no longer re-banners).
+  - The statusline tones the whole row in the statusline gray and grows the
+    reference's segments: `run /login` when signed out, `enter queue` while
+    streaming, a 32-cell session-title cap, `Context: 12k/200k 6%`, and the
+    workspace tail with its git branch. The activity row's dot, verb, and
+    elapsed wear the accent with a dim token tail, raw token counts, and the
+    compact `18m0s` elapsed grammar.
+  - The composer takes the reference's full-width top divider; picker
+    selection fills the row (selection background and ink) everywhere but
+    the model pickers, headers are uniformly dim, empty states use the
+    reference's wordings, nav hints degrade stepwise with the frame, and
+    the picker band shrinks with its rows instead of blank-padding to six.
+
 - `/tree` now restores the selected prompt text in the composer after
   rewinding. Edit it or resend it to grow the new branch without recreating
   the original prompt.
-
-- The footer picker band (commands, files, skills, sessions, models) is a
-  fixed height: it always shows six selectable rows, padded blank below a
-  short match list, so typing a filter — `/set` narrowing to one command —
-  no longer shrinks and grows the box under the composer.
 
 - Write and edit tool rows stay lean while running: the tree says
   "Writing src/lib.rs" and nothing more, instead of streaming the file's

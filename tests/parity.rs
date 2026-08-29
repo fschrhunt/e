@@ -101,6 +101,7 @@ fn the_palette_carries_the_reference_values() {
         ("comment", 243, 245),
         ("code", 241, 250),
         ("selected", 251, 239),
+        ("selectedInk", 237, 255),
     ];
     for (name, l, d) in expected {
         assert_eq!(light.vars.get(*name), Some(l), "light var {name}");
@@ -117,19 +118,29 @@ fn dark() -> Theme {
 #[test]
 fn code_panel_geometry_matches_the_reference() {
     let t = dark();
+    // The reference's own literals: a dim `─ label ─…` rule, flush-left
+    // code, a dim solid rule below — no side rails, no padding.
     assert_eq!(
         code_panel(&t, "x", "zig", 80),
-        vec!["┌ \x1b[2mzig\x1b[22m ─┐", "│ x    │", "└──────┘"]
+        vec!["\x1b[2m─ zig ─\x1b[22m", "x", "\x1b[2m───────\x1b[22m"]
     );
     assert_eq!(
         code_panel(&t, "x", "", 80),
-        vec!["┌────┐", "│ x  │", "└────┘"]
+        vec!["\x1b[2m──────\x1b[22m", "x", "\x1b[2m──────\x1b[22m"]
     );
-    // Label truncated to panel_width - 5 when the terminal is narrow.
+    // Label truncated by display width to panel_width - 4 when narrow.
     assert_eq!(
         code_panel(&t, "x", "typescript", 8),
-        vec!["┌ \x1b[2mtyp\x1b[22m ─┐", "│ x    │", "└──────┘"]
+        vec!["\x1b[2m─ type ─\x1b[22m", "x", "\x1b[2m────────\x1b[22m"]
     );
+    // A wide rune measures two cells, so the frame stays square.
+    assert_eq!(
+        code_panel(&t, "x", "漢", 6),
+        vec!["\x1b[2m─ 漢 ─\x1b[22m", "x", "\x1b[2m──────\x1b[22m"]
+    );
+    // An unlabeled fence with recognizable content names itself.
+    let inferred = code_panel(&t, "{\"a\": 1}", "", 80);
+    assert!(inferred[0].contains("─ json ─"), "{:?}", inferred[0]);
 }
 
 #[test]
@@ -147,9 +158,63 @@ fn code_panel_survives_a_degenerate_terminal_width() {
 fn lists_match_the_reference_glyphs_and_indent() {
     let t = dark();
     let out = render_markdown(&t, "- one\n  - nested\n\n1. numbered\n", 40).join("\n");
-    assert!(out.contains("\x1b[2m•\x1b[22m one"), "bullet: {out:?}");
-    assert!(out.contains("  \x1b[2m•\x1b[22m nested"), "nested: {out:?}");
-    assert!(out.contains("1. numbered"), "ordered: {out:?}");
+    // The reference keeps the bullet's trailing space inside the dim run,
+    // and dims ordered markers the same way.
+    assert!(out.contains("\x1b[2m• \x1b[22mone"), "bullet: {out:?}");
+    assert!(out.contains("  \x1b[2m• \x1b[22mnested"), "nested: {out:?}");
+    assert!(
+        out.contains("\x1b[2m1.\x1b[22m numbered"),
+        "ordered: {out:?}"
+    );
+
+    // Ordered markers echo the author's numbering instead of renumbering.
+    let echoed = render_markdown(&t, "1. a\n1. b\n", 40).join("\n");
+    assert!(echoed.contains("\x1b[2m1.\x1b[22m a"), "{echoed:?}");
+    assert!(echoed.contains("\x1b[2m1.\x1b[22m b"), "{echoed:?}");
+
+    // Task lists: a dim ☐ replaces the bullet; a done ✓ wears the accent.
+    let tasks = render_markdown(&t, "- [ ] open\n- [x] done\n", 40).join("\n");
+    assert!(tasks.contains("\x1b[2m☐ \x1b[22mopen"), "{tasks:?}");
+    assert!(
+        tasks.contains(&format!("{} done", t.fg("accent", "✓"))),
+        "{tasks:?}"
+    );
+}
+
+#[test]
+fn wrapping_reopens_styles_and_avoids_orphans() {
+    use e::tui::markdown::wrap_styled;
+    // A bold span crossing a seam closes at the row end and reopens on the
+    // next row — a repainted row never leans on the row above it.
+    let rows = wrap_styled("\x1b[1mbold words that wrap\x1b[22m tail", 12);
+    assert!(rows.len() >= 2, "{rows:?}");
+    assert!(rows[0].ends_with("\x1b[0m"), "{:?}", rows[0]);
+    assert!(rows[1].starts_with("\x1b[1m"), "{:?}", rows[1]);
+
+    // The reference's orphan rule: a lone last word pulls the previous word
+    // down with it.
+    let rows = wrap_styled("alpha beta gamma delta", 16);
+    assert_eq!(rows, vec!["alpha beta", "gamma delta"]);
+
+    // A link crossing a seam closes and reopens so each row hyperlinks.
+    let link = "\x1b]8;;https://x.dev\x1b\\\x1b[4mspanning link text\x1b[24m\x1b]8;;\x1b\\";
+    let rows = wrap_styled(link, 9);
+    assert!(rows.len() >= 2);
+    assert!(rows[0].ends_with("\x1b]8;;\x1b\\\x1b[0m"), "{:?}", rows[0]);
+    assert!(
+        rows[1].starts_with("\x1b]8;;https://x.dev\x1b\\"),
+        "{:?}",
+        rows[1]
+    );
+}
+
+#[test]
+fn soft_breaks_keep_the_authors_rows() {
+    let t = dark();
+    // The reference preserves the author's line breaks inside a paragraph
+    // instead of reflowing them into one.
+    let out = render_markdown(&t, "first line\nsecond line\n", 80);
+    assert_eq!(out, vec!["first line", "second line"]);
 }
 
 #[test]
@@ -354,10 +419,11 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     assert!(streaming[1].contains("Read src/core/mod.rs"));
     assert!(streaming[2].contains("Running cargo test"));
     assert!(streaming.iter().any(|line| line.contains("one")));
+    // The reference pluralizes the elision row: one hidden line is a "line".
     assert!(streaming
         .last()
         .unwrap()
-        .contains("1 lines more (ctrl o to view)"));
+        .contains("1 line more (ctrl o to view)"));
 
     group.finish_tool(
         2,
@@ -367,9 +433,10 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     );
     let done = group.lines_for_test(&theme, 80);
     // The reference withdraws pipe rows on completion — full output lives
-    // behind ctrl+o, never inline. Failure shows in the label and the tally.
+    // behind ctrl+o, never inline. A non-zero exit keeps its `Ran` row; the
+    // failure lives in the header tally.
     assert!(group.text.ends_with("· 1 failed"));
-    assert!(done[2].contains("Failed cargo test"));
+    assert!(done[2].contains("Ran cargo test"));
     assert!(!done.iter().any(|line| line.contains('│')));
 }
 
@@ -379,7 +446,16 @@ fn failed_turns_end_in_error_color() {
     let theme = e::tui::theme::resolve("dark", false);
     let block = Block::new(Kind::Error, "error: boom");
     let rows = block.lines_for_test(&theme, 80);
-    assert_eq!(rows[0], theme.fg("error", "  error: boom"));
+    // The reference notice grammar: `● Error:` in the error tone, the body
+    // in the system-notice text gray.
+    assert_eq!(
+        rows[0],
+        format!(
+            "{} {}",
+            theme.fg("error", "● Error:"),
+            theme.fg("customMessageText", "error: boom")
+        )
+    );
 }
 
 #[test]
@@ -410,7 +486,10 @@ fn running_write_and_edit_rows_stay_lean() {
         "hello\nworld\n",
     );
     let rows = group.lines_for_test(&theme, 80);
-    assert!(rows[1].contains("Wrote src/lib.rs") && rows[1].contains("+2 -0"));
+    // The reference stat suffix drops a zero side: `+2`, no ` -0`, with the
+    // diff-marker hue on the count.
+    assert!(rows[1].contains("Wrote src/lib.rs") && rows[1].contains("+2"));
+    assert!(!rows[1].contains("-0"));
     assert!(!rows.iter().any(|line| line.contains('│')));
 }
 
@@ -444,10 +523,9 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
     assert_eq!(t.blocks.len(), 3);
     assert_eq!(t.blocks[2].text, "1 tool call \u{b7} 1 read");
 
-    // Past the row cap the tallies stay complete; the most recent calls
-    // keep their rows and the earliest ones collapse into a count above
-    // them. (Rows render once a call leaves its pending state, so start
-    // them.)
+    // The reference never caps the tree: every started call keeps its row
+    // and the header carries the full tallies. (Rows render once a call
+    // leaves its pending state, so start them.)
     let many = (0..12).map(|i| read(10 + i, &format!("{i}.rs"))).collect();
     t.extend_tool_group(many);
     assert_eq!(t.blocks[2].text, "13 tool calls \u{b7} 13 read");
@@ -455,16 +533,14 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
         t.blocks[2].start_tool(id);
     }
     let rows = t.blocks[2].lines_for_test(&theme, 80);
-    assert_eq!(rows.len(), 1 + 1 + 7, "header, overflow count, recent rows");
-    assert!(rows[1].contains("\u{2026} 6 earlier tool calls"));
-    // The recent tail survives; the oldest work is what got folded away.
-    assert!(rows[2].contains("Reading 5.rs"));
+    assert_eq!(rows.len(), 1 + 13, "header plus every started call");
+    assert!(rows[1].contains("Reading c.rs"));
     assert!(rows.last().unwrap().contains("Reading 11.rs"));
-    assert!(!rows.iter().any(|line| line.contains("Reading c.rs")));
+    assert!(!rows.iter().any(|line| line.contains("earlier tool calls")));
 }
 
 #[test]
-fn picker_band_holds_a_fixed_height() {
+fn picker_band_shrinks_with_its_rows() {
     use e::tui::menu::{Menu, MenuItem, MenuKind, HINT_USE};
     let theme = e::tui::theme::resolve("dark", false);
     let items: Vec<MenuItem> = (0..17)
@@ -473,20 +549,32 @@ fn picker_band_holds_a_fixed_height() {
     let mut menu = Menu::new(MenuKind::Commands, "Commands", HINT_USE, items);
     let full = menu.render(&theme, 80);
     assert_eq!(full.len(), 6 + 4, "divider, header, blank, 6 rows, divider");
+    // The header is uniformly dim, count and filter hint included.
+    assert!(
+        full[1].contains("Commands 17 · Type to filter"),
+        "{:?}",
+        full[1]
+    );
+    assert!(full[1].starts_with(theme.fg_prefix("dim")), "{:?}", full[1]);
+    // The selected row fills: selection background and ink, no caret.
+    assert!(full[3].contains("\x1b[48;5;239m"), "{:?}", full[3]);
+    assert!(full[3].contains("\x1b[38;5;255m"), "{:?}", full[3]);
 
-    // Filtering down to one match keeps the band the same size: the match
-    // sits at the top, the remaining slots stay blank.
+    // Filtering down to one match shrinks the band with it — the reference
+    // never blank-pads a short list — and drops the filter clause from the
+    // header.
     menu.set_query("cmd15");
     let filtered = menu.render(&theme, 80);
-    assert_eq!(filtered.len(), full.len());
+    assert_eq!(filtered.len(), 1 + 4);
     assert!(filtered[3].contains("/cmd15"));
-    assert!(filtered[4].is_empty() && filtered[8].is_empty());
+    assert!(filtered[1].contains("Commands 1"), "{:?}", filtered[1]);
+    assert!(!filtered[1].contains("Type to filter"), "{:?}", filtered[1]);
 
-    // No match at all: the same size, the notice on the first body row.
+    // No match at all: the notice alone, in the reference's own words.
     menu.set_query("zzz");
     let empty = menu.render(&theme, 80);
-    assert_eq!(empty.len(), full.len());
-    assert!(empty[3].contains("Nothing found."));
+    assert_eq!(empty.len(), 1 + 4);
+    assert!(empty[3].contains("no matching slash commands"));
 }
 
 #[test]
@@ -550,11 +638,19 @@ fn sleep_events_speak_in_the_system_grammar() {
         ),
     );
     let rows = resumed.lines_for_test(&theme, 80);
+    // The reference notice grammar: bold accent label, notice-gray body.
     assert_eq!(
         rows[0],
-        theme.fg(
-            "dim",
-            "● System: the device was asleep for 3m 10s — continuing"
+        format!(
+            "\x1b[1m{}\x1b[22m {}",
+            theme.fg("customMessageLabel", "● System:"),
+            theme.fg(
+                "customMessageText",
+                &format!(
+                    "the device was asleep for {} — continuing",
+                    format_elapsed(190)
+                )
+            )
         )
     );
 
@@ -570,9 +666,16 @@ fn sleep_events_speak_in_the_system_grammar() {
     let rows = stopped.lines_for_test(&theme, 80);
     assert_eq!(
         rows[0],
-        theme.fg(
-            "dim",
-            "● System: run stopped — the device was asleep for 22m 00s"
+        format!(
+            "\x1b[1m{}\x1b[22m {}",
+            theme.fg("customMessageLabel", "● System:"),
+            theme.fg(
+                "customMessageText",
+                &format!(
+                    "run stopped — the device was asleep for {}",
+                    format_elapsed(22 * 60)
+                )
+            )
         )
     );
 }
