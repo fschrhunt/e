@@ -166,7 +166,7 @@ fn lock_owner_alive(lock_path: &Path) -> bool {
     }
 }
 
-fn normalized_cwd(cwd: &Path) -> PathBuf {
+pub fn normalized_cwd(cwd: &Path) -> PathBuf {
     cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
 }
 
@@ -480,6 +480,10 @@ pub struct SessionInfo {
     pub title: String,
     pub modified: u64,
     pub message_count: usize,
+    /// User messages only — the picker's "N turns" count.
+    pub user_turns: usize,
+    /// The workspace the session was recorded in, from its header.
+    pub cwd: PathBuf,
     /// A name an extension set, overriding the derived title.
     pub name: Option<String>,
 }
@@ -513,6 +517,28 @@ pub fn most_recent(cwd: &Path) -> Option<PathBuf> {
     list(cwd).into_iter().next().map(|s| s.path)
 }
 
+/// Every saved session across all workspaces, newest first — the resume
+/// picker's "All workspaces" scope.
+pub fn list_all() -> Vec<SessionInfo> {
+    let Ok(workspaces) = std::fs::read_dir(home::sessions_dir()) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for workspace in workspaces.flatten() {
+        let Ok(entries) = std::fs::read_dir(workspace.path()) else {
+            continue;
+        };
+        sessions.extend(
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+                .filter_map(|e| info(&e.path(), None)),
+        );
+    }
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    sessions
+}
+
 fn info(path: &Path, expected_cwd: Option<&Path>) -> Option<SessionInfo> {
     // Read messages and any extension-set name in one pass.
     let reader = BufReader::new(File::open(path).ok()?);
@@ -533,8 +559,9 @@ fn info(path: &Path, expected_cwd: Option<&Path>) -> Option<SessionInfo> {
             Err(_) => {}
         }
     }
+    let session_cwd = session_cwd.unwrap_or_default();
     if let Some(expected_cwd) = expected_cwd {
-        if normalized_cwd(&session_cwd?) != expected_cwd {
+        if session_cwd.as_os_str().is_empty() || normalized_cwd(&session_cwd) != expected_cwd {
             return None;
         }
     }
@@ -556,6 +583,8 @@ fn info(path: &Path, expected_cwd: Option<&Path>) -> Option<SessionInfo> {
         title: name.clone().unwrap_or(title),
         modified,
         message_count: messages.len(),
+        user_turns: messages.iter().filter(|m| m.role == "user").count(),
+        cwd: session_cwd,
         name,
     })
 }

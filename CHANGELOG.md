@@ -8,6 +8,45 @@ release notes are that section verbatim), open a fresh empty
 
 ## Unreleased
 
+- An exactness batch closing the remaining gaps against the reference
+  design, each behavior verified in its source before porting:
+  - Picker tabs: the skills picker gains Source tabs (All · Global ·
+    Workspace, from e's own two skill roots), the model picker Provider
+    tabs (All plus each provider with models, degrading to a window around
+    the active tab with dim `…` markers), and /resume Scope tabs (Current
+    workspace · All workspaces, opening on the current one). Tab cycles;
+    headers brighten `{title} {count}` with the active tab `[bracketed]`,
+    degrade per the reference's ladders, and the hints name the dimension
+    (`Tab Source` / `Tab Provider` / `Tab Scope`).
+  - Selection corrected to the reference's real split: the catalog menus
+    (models, skills, sessions, /tree) signal by brightness alone; only the
+    inline completion pickers (slash commands, files) fill the row.
+  - Skills rows go single-line — name plus a right scope column, no
+    description — and sessions rows carry the `workspace · age · N turns`
+    cluster in shared fixed columns (age right-aligned, compact `now/5m/2h/1d`
+    grammar, turns = user messages), the title middle-ellipsized into its
+    column and metadata hiding below a twelve-cell title floor.
+  - /resume lists every workspace's sessions (scoped by the tabs), and
+    session logs expose their recorded workspace for the cluster.
+  - A queued-prompt banner above the composer while a turn runs with
+    messages waiting (`N steering messages · ↑ to edit`, ink-bright), and
+    the queue review behind it: ↑ on an empty composer pauses the queue
+    and loads the newest prompt for editing, ↑/↓ step entries, Enter
+    commits edits back (an emptied draft sends unchanged), Backspace on an
+    emptied draft deletes the entry, and a fresh prompt or turn end
+    resumes. With the banner above it the composer trades its leading
+    blank for its top divider — the reference's chrome rule.
+  - Composer shift-arrow selection: shift with any motion extends a
+    reverse-video range, plain arrows collapse to its edge, typing or
+    Backspace replaces it.
+  - File picker rows segment long paths the reference way — dirname
+    middle-ellipsized into a narrow fixed budget, basename prefix-biased —
+    directories list too, with a trailing slash.
+  - Markdown footnotes: `[^label]` renders a dim `[N]` numbered by first
+    use; definitions collect out of the flow and close the message with
+    dim `[N] ` markers and a hanging indent; unreferenced definitions
+    never print.
+
 - A functionality pass inheriting the reference design's behavior — all of
   it except the sandbox/permission layer, which e deliberately does not
   have (tools keep running without prompts; see the safety model):
@@ -38,7 +77,7 @@ release notes are that section verbatim), open a fresh empty
     bytes or an oversized URL render as plain text instead of corrupting
     the terminal's escape stream.
 
-- A full visual-parity pass against the current reference design (fx). The
+- A full visual-parity pass against the current reference design. The
   look moves to the reference's own literals across every surface:
   - Code fences drop the box frame for the reference's dim horizontal rules
     (`─ lang ────`) with flush-left code, a content-inferred label for
@@ -71,11 +110,11 @@ release notes are that section verbatim), open a fresh empty
     workspace tail with its git branch. The activity row's dot, verb, and
     elapsed wear the accent with a dim token tail and the compact `18m0s`
     elapsed grammar.
-  - Picker
-    selection fills the row (selection background and ink) everywhere but
-    the model pickers, headers are uniformly dim, empty states use the
-    reference's wordings, nav hints degrade stepwise with the frame, and
-    the picker band shrinks with its rows instead of blank-padding to six.
+  - Inline picker selection fills the row (selection background and ink;
+    the catalog menus brighten instead — see the exactness batch above),
+    headers are uniformly dim, empty states use the reference's wordings,
+    nav hints degrade stepwise with the frame, and the picker band shrinks
+    with its rows instead of blank-padding to six.
 
 - `/tree` now restores the selected prompt text in the composer after
   rewinding. Edit it or resend it to grow the new branch without recreating

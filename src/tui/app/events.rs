@@ -208,10 +208,23 @@ impl App {
                     };
                 }
                 if !content.trim().is_empty() {
-                    self.remember_output(
+                    let detail = self.remember_output(
                         title.unwrap_or_else(|| "tool output".into()),
                         crate::core::tools::sanitize_display(&content),
                     );
+                    // Link the stored detail to its row for the review
+                    // screen.
+                    if let Some(s) = &self.active {
+                        if let Some(&idx) = s.tool_blocks.get(&id) {
+                            if let Some(block) = self.transcript.blocks.get_mut(idx) {
+                                if let Some(child) =
+                                    block.tool_children.iter_mut().find(|child| child.id == id)
+                                {
+                                    child.detail = Some(detail);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             SessionEvent::Usage {
@@ -322,6 +335,8 @@ impl App {
                 // still showing is stale.
                 self.question = None;
                 self.question_queue.clear();
+                // The queue the review was editing died with the turn.
+                self.close_queue_review();
                 let stranded = self.agent.on_turn_end();
                 if aborted {
                     // Every started or serially pending member reaches a

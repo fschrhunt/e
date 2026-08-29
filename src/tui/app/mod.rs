@@ -19,7 +19,9 @@ use crate::core::providers::catalog::{self as model, Model};
 use crate::tui::authpanel::{self, AuthStage};
 use crate::tui::background::stdout_is_tty;
 use crate::tui::composer::{Editor, EditorResult, Key};
-use crate::tui::menu::{Menu, MenuItem, MenuKind, HINT_SCOPED, HINT_USE};
+use crate::tui::menu::{
+    Menu, MenuItem, MenuKind, HINT_MODELS, HINT_SCOPED, HINT_SESSIONS, HINT_SKILLS, HINT_USE,
+};
 use crate::tui::screen::Painter;
 use crate::tui::statusline::{
     format_elapsed, statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase,
@@ -63,10 +65,23 @@ struct ActiveTurn {
 
 /// The ctrl+o full-detail screen: one stored output at a time, scrollable,
 /// ←/→ switching between outputs — the reference surface, e-sized.
+/// The ctrl+o review screen: the whole transcript with tool details
+/// spliced in, at one of the reference's two depths — Review folds each
+/// detail to three lines behind a `→ to expand` hint, Full shows all.
 struct Viewer {
-    /// Index into App::outputs.
-    index: usize,
+    full: bool,
     scroll: usize,
+}
+
+/// The queued-prompt review's working state: a snapshot of the paused
+/// queue (oldest first), which entry the composer holds, and whether a
+/// draft is showing at all (↓ past the newest hides it while the queue
+/// stays paused).
+struct QueueReview {
+    entries: Vec<String>,
+    dirty: Vec<bool>,
+    selected: usize,
+    visible: bool,
 }
 
 /// Asynchronous work landing back in the frame loop.
@@ -245,14 +260,18 @@ struct App {
     reloading: bool,
     /// Transcript index of the reload notice, replaced when reload finishes.
     reload_block: Option<usize>,
-    /// Full tool outputs for the ctrl+o viewer: (title, content), newest
-    /// last, capped.
-    outputs: Vec<(String, String)>,
+    /// Full tool outputs for the ctrl+o review screen: (id, title, content),
+    /// newest last, capped; ids link tool children to their details.
+    outputs: Vec<(u64, String, String)>,
+    output_seq: u64,
     /// The ctrl+o full-detail viewer, when open.
     viewer: Option<Viewer>,
     /// The ask tool's open question, and any batch-mates queued behind it.
     question: Option<crate::tui::questionpanel::Question>,
     question_queue: std::collections::VecDeque<crate::tui::questionpanel::Question>,
+    /// The queued-prompt review: ↑ on an empty composer while prompts wait
+    /// pauses the queue and loads the newest into the composer for editing.
+    queue_review: Option<QueueReview>,
     /// Bumped whenever session identity changes (/new, resume). Async work
     /// launched in one epoch may not mutate a later one: a late extension
     /// command or shell result carries the epoch it started in and is
@@ -275,39 +294,88 @@ struct App {
 }
 
 impl App {
-    /// The full-detail screen: title, a scroll window, the reference's
-    /// footer wording.
+    /// The review screen's body: the whole transcript, with each child
+    /// row's stored detail railed beneath it — folded to three lines behind
+    /// the reference's `→ to expand` hint at Review depth, whole at Full.
+    fn viewer_rows(&self, width: usize, full: bool) -> Vec<String> {
+        const REVIEW_DETAIL_LINES: usize = 3;
+        let mut rows: Vec<String> = Vec::new();
+        for block in &self.transcript.blocks {
+            let lines = block.review_lines(&self.theme, width);
+            if lines.is_empty() {
+                continue;
+            }
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            for (row, detail) in lines {
+                rows.push(crate::tui::markdown::clip_styled(&row, width));
+                let Some(id) = detail else { continue };
+                let Some(body) = self.output_body(id) else {
+                    rows.push(self.theme.fg("dim", "│  Full saved result unavailable."));
+                    continue;
+                };
+                let body_lines: Vec<&str> = body.lines().collect();
+                let shown = if full {
+                    body_lines.len()
+                } else {
+                    body_lines.len().min(REVIEW_DETAIL_LINES)
+                };
+                let mut clipped_any = false;
+                for line in &body_lines[..shown] {
+                    let railed = match self.diff_row_color(line) {
+                        Some(colored) => {
+                            format!("{} {colored}", self.theme.fg("dim", "│"))
+                        }
+                        None => self.theme.fg("dim", &format!("│ {line}")),
+                    };
+                    if crate::tui::markdown::visible_width(&railed) > width {
+                        clipped_any = true;
+                    }
+                    rows.push(crate::tui::markdown::clip_styled(&railed, width));
+                }
+                let hidden = body_lines.len() - shown;
+                if hidden > 0 {
+                    let noun = if hidden == 1 { "line" } else { "lines" };
+                    rows.push(
+                        self.theme
+                            .fg("dim", &format!("│  {hidden} more {noun} · → to expand")),
+                    );
+                } else if !full && clipped_any {
+                    rows.push(self.theme.fg("dim", "│  line clipped · → to expand"));
+                }
+            }
+        }
+        rows
+    }
+
+    /// The ctrl+o review screen: a scroll window over the projected
+    /// transcript, the `┃ Review …` navigation row at the bottom — the
+    /// reference's own wording per depth.
     fn viewer_frame(&self, width: usize, height: usize) -> Vec<String> {
         let Some(viewer) = &self.viewer else {
             return Vec::new();
         };
-        let Some((title, content)) = self.outputs.get(viewer.index) else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        rows.push(format!(
-            "{}{}",
-            crate::tui::render::bold(title),
-            self.theme.fg(
-                "muted",
-                &format!("  ({}/{})", viewer.index + 1, self.outputs.len())
-            )
-        ));
-        rows.push(String::new());
-        let body: Vec<&str> = content.lines().collect();
-        let window = height.saturating_sub(4).max(1);
-        for line in body.iter().skip(viewer.scroll).take(window) {
-            let shown = self
-                .diff_row_color(line)
-                .unwrap_or_else(|| line.to_string());
-            rows.push(crate::tui::markdown::clip_styled(&shown, width));
-        }
-        while rows.len() < height.saturating_sub(1) {
+        let body = self.viewer_rows(width, viewer.full);
+        let window = height.saturating_sub(1).max(1);
+        let mut rows: Vec<String> = body
+            .iter()
+            .skip(viewer.scroll)
+            .take(window)
+            .cloned()
+            .collect();
+        while rows.len() < window {
             rows.push(String::new());
         }
-        rows.push(self.theme.fg(
-            "muted",
-            "Full detail · ←/→ switch · ↑↓/pgup·pgdn scroll · ctrl o close · Esc close",
+        let nav = if viewer.full {
+            "Full detail · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close"
+        } else {
+            "Review · ←/→ switch · ctrl o close · PgUp/PgDn scroll · Esc close"
+        };
+        rows.push(format!(
+            "{} {}",
+            self.theme.fg("userMessageText", "┃"),
+            self.theme.fg("muted", nav)
         ));
         rows
     }
@@ -375,6 +443,21 @@ impl App {
         let mut lines = self
             .transcript
             .render_animated(&self.theme, width, blink_on);
+        // The reference's transient running-tool row: the focused call
+        // leaves its tree and paints directly below the transcript (no
+        // gap), its marker blinking; the activity row follows one blank
+        // further down.
+        if self.active.is_some() {
+            if let Some(group) = self
+                .transcript
+                .blocks
+                .iter()
+                .rev()
+                .find(|b| b.kind == Kind::ToolGroup && !b.done)
+            {
+                lines.extend(group.overlay_rows(&self.theme, width, blink_on));
+            }
+        }
         if let Some(s) = &self.active {
             if let Some(label) = s.turn.label(s.started.elapsed().as_secs()) {
                 lines.push(String::new());
@@ -388,12 +471,13 @@ impl App {
                     // reads distinctly from ordinary thinking.
                     let dot = if blink_on { "•" } else { " " };
                     lines.push(self.theme.fg("warning", &format!("{dot} {label}")));
-                } else if s.turn.phase == TurnPhase::Thinking {
+                } else if matches!(s.turn.phase, TurnPhase::Thinking | TurnPhase::Tool) {
                     // The reference runs the activity dot on the same column
-                    // as the user rail — flush left, no indent. The blink is
-                    // presence, not color: the dot shows and hides, no dim
-                    // half-state between. Dot, verb, and elapsed wear the
-                    // accent; the token tail drops to dim.
+                    // as the user rail — flush left, no indent, and keeps
+                    // ticking through tool phases below the transient tool
+                    // row. The blink is presence, not color: the dot shows
+                    // and hides, no dim half-state between. Dot, verb, and
+                    // elapsed wear the accent; the token tail drops to dim.
                     let (main, tokens) = s
                         .turn
                         .label_parts(s.started.elapsed().as_secs())
@@ -419,7 +503,43 @@ impl App {
             // The reference caps the composer at half the frame plus one
             // row; a longer draft scrolls behind the ┃↑ marker.
             let cap = (height / 2 + 1).max(3);
-            lines.extend(self.editor.render(&self.theme, width, cap));
+            let mut composer = self.editor.render(&self.theme, width, cap);
+            // The queued banner band: the collapsed summary (ink-bright),
+            // a paused hint when the review holds the queue, a gap row —
+            // and with chrome above it the composer trades its leading
+            // blank for its top divider, the reference's rule.
+            let steering = self.agent.queued_count();
+            let total = steering + self.held_prompts.len();
+            if total > 0 && self.active.is_some() {
+                let paused = self.queue_review.is_some();
+                let affordance = if paused { "" } else { " · ↑ to edit" };
+                let ordinary = total - steering;
+                let label = if ordinary == 0 && steering == 1 {
+                    format!("1 steering message{affordance}")
+                } else if ordinary == 0 {
+                    format!("{steering} steering messages{affordance}")
+                } else if steering > 0 {
+                    format!("{total} pending messages · {steering} steering{affordance}")
+                } else if total == 1 {
+                    format!("1 queued message{affordance}")
+                } else {
+                    format!("{total} queued messages{affordance}")
+                };
+                lines.push(self.theme.fg("userMessageText", &label));
+                if let Some(review) = &self.queue_review {
+                    let hint = if !review.visible {
+                        "steering paused · enter to apply"
+                    } else if self.editor.is_empty() {
+                        "paused · delete again to remove queued prompt · enter to send unchanged"
+                    } else {
+                        "paused · enter to send"
+                    };
+                    lines.push(self.theme.fg("dim", hint));
+                }
+                lines.push(String::new());
+                composer[0] = self.theme.fg("border", &"─".repeat(width));
+            }
+            lines.extend(composer);
         }
         if let Some(stage) = &self.trust {
             let dir = self.agent.cwd().to_string_lossy().into_owned();
@@ -526,6 +646,125 @@ impl App {
         self.refresh_status_cache();
     }
 
+    /// Queued-prompt review keys, the reference's grammar: ↑ on an empty
+    /// composer while prompts wait opens the newest for editing (queue
+    /// draining pauses); ↑/↓ step older/newer, ↓ past the newest hides the
+    /// draft; Enter commits edits back to the queue and resumes — an empty
+    /// draft leaves its entry unchanged; Backspace on an emptied draft
+    /// deletes the entry. Returns true when the key was consumed.
+    fn queue_review_key(&mut self, code: KeyCode) -> bool {
+        if self.trust.is_some()
+            || self.question.is_some()
+            || self.auth.is_some()
+            || self.settings.is_some()
+            || self.menu.is_some()
+        {
+            return false;
+        }
+        let Some(mut review) = self.queue_review.take() else {
+            if code == KeyCode::Up
+                && self.editor.is_empty()
+                && self.active.is_some()
+                && self.agent.queued_count() > 0
+            {
+                self.agent.pause_queue(true);
+                let entries = self.agent.queued();
+                let selected = entries.len() - 1;
+                let dirty = vec![false; entries.len()];
+                self.editor.set_text(&entries[selected]);
+                self.queue_review = Some(QueueReview {
+                    entries,
+                    dirty,
+                    selected,
+                    visible: true,
+                });
+                return true;
+            }
+            return false;
+        };
+        let stash = |review: &mut QueueReview, text: String| {
+            if review.entries[review.selected] != text {
+                review.entries[review.selected] = text;
+                review.dirty[review.selected] = true;
+            }
+        };
+        let consumed = match code {
+            KeyCode::Up => {
+                if review.visible {
+                    stash(&mut review, self.editor.text());
+                    if review.selected > 0 {
+                        review.selected -= 1;
+                        self.editor.set_text(&review.entries[review.selected]);
+                    }
+                    true
+                } else if self.editor.is_empty() {
+                    review.visible = true;
+                    self.editor.set_text(&review.entries[review.selected]);
+                    true
+                } else {
+                    false
+                }
+            }
+            KeyCode::Down if review.visible => {
+                stash(&mut review, self.editor.text());
+                if review.selected + 1 < review.entries.len() {
+                    review.selected += 1;
+                    self.editor.set_text(&review.entries[review.selected]);
+                } else {
+                    self.editor.set_text("");
+                    review.visible = false;
+                }
+                true
+            }
+            // Enter with the draft hidden and new text typed is a fresh
+            // prompt: fall through so the ordinary submit takes it (and
+            // closes the review).
+            KeyCode::Enter if review.visible || self.editor.is_empty() => {
+                // The visible draft commits only when it holds text — an
+                // emptied draft sends its entry unchanged.
+                if review.visible && !self.editor.is_empty() {
+                    stash(&mut review, self.editor.text());
+                }
+                if review.dirty.iter().any(|d| *d) {
+                    // Edits that trimmed away entirely drop their entry.
+                    let entries: Vec<String> = review
+                        .entries
+                        .iter()
+                        .map(|e| e.trim().to_string())
+                        .filter(|e| !e.is_empty())
+                        .collect();
+                    self.agent.set_queued(entries);
+                }
+                self.editor.set_text("");
+                self.agent.pause_queue(false);
+                return true;
+            }
+            KeyCode::Backspace if review.visible && self.editor.is_empty() => {
+                review.entries.remove(review.selected);
+                review.dirty.remove(review.selected);
+                self.agent.set_queued(review.entries.clone());
+                if review.entries.is_empty() {
+                    self.agent.pause_queue(false);
+                    return true;
+                }
+                review.selected = review.selected.min(review.entries.len() - 1);
+                self.editor.set_text(&review.entries[review.selected]);
+                true
+            }
+            _ => false,
+        };
+        self.queue_review = Some(review);
+        consumed
+    }
+
+    /// Close the review without committing the visible draft — a new
+    /// prompt or a turn end resumes the queue as it stands.
+    fn close_queue_review(&mut self) {
+        if self.queue_review.take().is_some() {
+            self.agent.pause_queue(false);
+        }
+    }
+
     fn open_resume_menu(&mut self) {
         // Both checks: `active` covers a turn whose TurnStart has been seen,
         // `is_streaming` covers the gap between submit and that event.
@@ -533,8 +772,11 @@ impl App {
             self.notice("a turn is running — press Esc to stop it, then /resume".into());
             return;
         }
-        let cwd = self.agent.cwd();
-        let items: Vec<MenuItem> = crate::core::session::list(&cwd)
+        let cwd = crate::core::session::normalized_cwd(&self.agent.cwd());
+        // Every workspace's sessions, with a Tab-cycled scope filter that
+        // opens on the current workspace. Each row carries the reference's
+        // dim right cluster: `workspace · age · N turns`.
+        let items: Vec<MenuItem> = crate::core::session::list_all()
             .into_iter()
             .map(|info| {
                 let mut item = MenuItem::new(
@@ -546,15 +788,41 @@ impl App {
                     "",
                     &info.path.to_string_lossy(),
                 );
-                item.meta = format!("{} · {} msgs", ago(info.modified), info.message_count);
+                let workspace = info
+                    .cwd
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let turns = format!(
+                    "{} {}",
+                    info.user_turns,
+                    if info.user_turns == 1 {
+                        "turn"
+                    } else {
+                        "turns"
+                    }
+                );
+                item.meta = format!("{workspace} · {} · {turns}", ago(info.modified));
+                item.tab = Some(if crate::core::session::normalized_cwd(&info.cwd) == cwd {
+                    0
+                } else {
+                    1
+                });
                 item
             })
             .collect();
         if items.is_empty() {
-            self.notice("no saved sessions for this workspace".into());
+            self.notice("no saved sessions".into());
             return;
         }
-        self.menu = Some(Menu::new(MenuKind::Sessions, "Sessions", HINT_USE, items));
+        self.menu = Some(
+            Menu::new(MenuKind::Sessions, "Sessions", HINT_SESSIONS, items).with_tabs(
+                vec!["Current workspace".into(), "All workspaces".into()],
+                Some(1),
+                0,
+                "",
+            ),
+        );
     }
 
     fn resume_recent(&mut self) {
@@ -657,13 +925,20 @@ impl App {
                         }
                         group.finish_tool(id, outcome, summary, &m.content);
                     }
-                    // Recorded results come back to the ctrl+o viewer, the
-                    // same store the live session fills.
+                    // Recorded results come back to the ctrl+o review
+                    // screen, the same store the live session fills.
                     if !m.content.trim().is_empty() {
-                        self.remember_output(
+                        let detail = self.remember_output(
                             title.unwrap_or_else(|| "tool output".into()),
                             crate::core::tools::sanitize_display(&m.content),
                         );
+                        if let Some(group) = self.transcript.blocks.get_mut(block) {
+                            if let Some(child) =
+                                group.tool_children.iter_mut().find(|child| child.id == id)
+                            {
+                                child.detail = Some(detail);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1123,6 +1398,9 @@ impl App {
     }
 
     fn prompt(&mut self, text: String) {
+        // A fresh prompt closes the queued-prompt review and resumes the
+        // queue — the reference's resume-after-new-prompt.
+        self.close_queue_review();
         // While compacting, reloading, or a `!` shell command is running,
         // hold the message; it submits (and displays) when the block lifts —
         // a turn must not start without the shell output it was promised.
@@ -1238,17 +1516,27 @@ impl App {
         });
     }
 
-    fn remember_output(&mut self, title: String, content: String) {
+    /// Store a full tool output for the review screen, returning its stable
+    /// id. Eviction under the budget leaves a dangling id behind — the
+    /// screen then says "Full saved result unavailable.", honestly.
+    fn remember_output(&mut self, title: String, content: String) -> u64 {
         const OUTPUT_BUDGET: usize = 4 * 1024 * 1024;
-        self.outputs.push((title, content));
-        let mut bytes: usize = self.outputs.iter().map(|(_, body)| body.len()).sum();
+        self.output_seq += 1;
+        let id = self.output_seq;
+        self.outputs.push((id, title, content));
+        let mut bytes: usize = self.outputs.iter().map(|(_, _, body)| body.len()).sum();
         while self.outputs.len() > 1 && (self.outputs.len() > 50 || bytes > OUTPUT_BUDGET) {
-            let removed = self.outputs.remove(0).1.len();
+            let removed = self.outputs.remove(0).2.len();
             bytes = bytes.saturating_sub(removed);
-            if let Some(viewer) = &mut self.viewer {
-                viewer.index = viewer.index.saturating_sub(1);
-            }
         }
+        id
+    }
+
+    fn output_body(&self, id: u64) -> Option<&str> {
+        self.outputs
+            .iter()
+            .find(|(stored, _, _)| *stored == id)
+            .map(|(_, _, body)| body.as_str())
     }
 
     /// /reload, the reference behavior: refresh what a session caches. In e
@@ -1436,7 +1724,7 @@ fn ago(ms: u64) -> String {
         .unwrap_or(0);
     let secs = now.saturating_sub(ms) / 1000;
     if secs < 60 {
-        format!("{secs}s")
+        "now".to_string()
     } else if secs < 3600 {
         format!("{}m", secs / 60)
     } else if secs < 86400 {
@@ -1627,6 +1915,16 @@ fn key_of(event: &KeyEvent, keymap: &crate::core::config::keybindings::Keymap) -
         (KeyCode::Backspace, _, true) => Key::KillWord,
         (KeyCode::Backspace, ..) => Key::Backspace,
         (KeyCode::Delete, ..) => Key::Delete,
+        // Shift extends a selection through the same motions — the
+        // reference's shift-arrow grammar; typing then replaces the range.
+        (KeyCode::Left, _, true) if shift => Key::SelectWordLeft,
+        (KeyCode::Right, _, true) if shift => Key::SelectWordRight,
+        (KeyCode::Left, ..) if shift => Key::SelectLeft,
+        (KeyCode::Right, ..) if shift => Key::SelectRight,
+        (KeyCode::Up, ..) if shift => Key::SelectUp,
+        (KeyCode::Down, ..) if shift => Key::SelectDown,
+        (KeyCode::Home, ..) if shift => Key::SelectHome,
+        (KeyCode::End, ..) if shift => Key::SelectEnd,
         (KeyCode::Left, _, true) => Key::WordLeft,
         (KeyCode::Right, _, true) => Key::WordRight,
         (KeyCode::Left, ..) => Key::Left,
@@ -1751,9 +2049,11 @@ pub async fn run(
         reloading: false,
         reload_block: None,
         outputs: Vec::new(),
+        output_seq: 0,
         viewer: None,
         question: None,
         question_queue: std::collections::VecDeque::new(),
+        queue_review: None,
         session_epoch: 0,
         update_installed: None,
         relaunch: false,
@@ -1821,7 +2121,7 @@ pub async fn run(
     }
 
     // Terminal tab title: the custom glyph, a dot, the path — a named
-    // session takes over the title when one lands (fx also prefers the
+    // session takes over the title when one lands (the reference prefers the
     // session name over the workspace).
     set_tab_title(&tab_title(
         &title_path(),
@@ -1874,46 +2174,40 @@ pub async fn run(
                                 || (ctrl && k.code == KeyCode::Char('o'));
                             if close {
                                 app.viewer = None;
-                            } else if let Some(viewer) = &mut app.viewer {
-                                let total = app
-                                    .outputs
-                                    .get(viewer.index)
-                                    .map(|(_, c)| c.lines().count())
-                                    .unwrap_or(0);
-                                match k.code {
-                                    KeyCode::Up => viewer.scroll = viewer.scroll.saturating_sub(1),
-                                    KeyCode::Down => {
-                                        viewer.scroll = (viewer.scroll + 1)
-                                            .min(total.saturating_sub(1))
+                            } else {
+                                let full =
+                                    app.viewer.as_ref().map(|v| v.full).unwrap_or(false);
+                                let total = app.viewer_rows(cols as usize, full).len();
+                                if let Some(viewer) = &mut app.viewer {
+                                    match k.code {
+                                        KeyCode::Up => {
+                                            viewer.scroll = viewer.scroll.saturating_sub(1)
+                                        }
+                                        KeyCode::Down => {
+                                            viewer.scroll =
+                                                (viewer.scroll + 1).min(total.saturating_sub(1))
+                                        }
+                                        KeyCode::PageUp => {
+                                            viewer.scroll = viewer.scroll.saturating_sub(20)
+                                        }
+                                        KeyCode::PageDown => {
+                                            viewer.scroll =
+                                                (viewer.scroll + 20).min(total.saturating_sub(1))
+                                        }
+                                        // ←/→ switch between the reference's
+                                        // two depths: Review folds details,
+                                        // Full expands everything.
+                                        KeyCode::Left => viewer.full = false,
+                                        KeyCode::Right => viewer.full = true,
+                                        _ => {}
                                     }
-                                    KeyCode::PageUp => {
-                                        viewer.scroll = viewer.scroll.saturating_sub(20)
-                                    }
-                                    KeyCode::PageDown => {
-                                        viewer.scroll = (viewer.scroll + 20)
-                                            .min(total.saturating_sub(1))
-                                    }
-                                    KeyCode::Left => {
-                                        viewer.index = viewer.index.saturating_sub(1);
-                                        viewer.scroll = 0;
-                                    }
-                                    KeyCode::Right => {
-                                        viewer.index = (viewer.index + 1)
-                                            .min(app.outputs.len().saturating_sub(1));
-                                        viewer.scroll = 0;
-                                    }
-                                    _ => {}
                                 }
                             }
                         } else if ctrl && k.code == KeyCode::Char('o') {
-                            if app.outputs.is_empty() {
-                                app.notice("no tool output to view yet".into());
-                            } else {
-                                app.viewer = Some(Viewer {
-                                    index: app.outputs.len() - 1,
-                                    scroll: 0,
-                                });
-                            }
+                            app.viewer = Some(Viewer {
+                                full: false,
+                                scroll: 0,
+                            });
                         } else if let Some(stage) = &mut app.trust {
                             match k.code {
                                 KeyCode::Up | KeyCode::Down => stage.selected = 1 - stage.selected,
@@ -2129,12 +2423,16 @@ pub async fn run(
                                 app.toggle_scoped();
                             }
                         } else if app.menu.is_some()
-                            && matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc)
+                            && (matches!(k.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc)
+                                || (k.code == KeyCode::Tab
+                                    && !k.modifiers.contains(KeyModifiers::SHIFT)
+                                    && app.menu.as_ref().unwrap().has_tabs()))
                             && !ctrl
                         {
                             match k.code {
                                 KeyCode::Up => { app.menu.as_mut().unwrap().step(-1); }
                                 KeyCode::Down => { app.menu.as_mut().unwrap().step(1); }
+                                KeyCode::Tab => { app.menu.as_mut().unwrap().cycle_tab(); }
                                 KeyCode::Enter => { app.select_menu(); }
                                 KeyCode::Esc => {
                                     app.menu = None;
@@ -2184,6 +2482,8 @@ pub async fn run(
                                 Ok(None) => app.notice("this model has no reasoning effort control".into()),
                                 Err(error) => app.notice(format!("could not save reasoning effort: {error}")),
                             }
+                        } else if !ctrl && app.queue_review_key(k.code) {
+                            // Consumed by the queued-prompt review.
                         } else if let Some(key) = key_of(&k, &app.keymap) {
                             if let EditorResult::Submit(text) = app.editor.key(key) {
                                 app.submit(text);
@@ -2847,9 +3147,11 @@ mod tests {
             reloading: false,
             reload_block: None,
             outputs: Vec::new(),
+            output_seq: 0,
             viewer: None,
             question: None,
             question_queue: std::collections::VecDeque::new(),
+            queue_review: None,
             session_epoch: 0,
             update_installed: None,
             relaunch: false,

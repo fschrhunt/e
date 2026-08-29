@@ -154,8 +154,11 @@ impl Turn {
 
     /// The Thinking label split at the token suffix, so the paint layer can
     /// tone the verb and the `(↑… ↓…)` tail separately the reference way.
+    /// The clock keeps ticking through tool phases — the reference's `•
+    /// Thinking (Ns)` row runs below the transient tool row.
     pub fn label_parts(&self, elapsed_secs: u64) -> Option<(String, String)> {
-        if self.recovered.is_some() || self.phase != TurnPhase::Thinking {
+        if self.recovered.is_some() || !matches!(self.phase, TurnPhase::Thinking | TurnPhase::Tool)
+        {
             return None;
         }
         let tokens = self.tokens();
@@ -178,7 +181,7 @@ impl Turn {
             return Some(format!("Recovered · attempt {}/{}", r.attempt, r.limit));
         }
         match self.phase {
-            TurnPhase::Thinking => {
+            TurnPhase::Thinking | TurnPhase::Tool => {
                 let (main, suffix) = self.label_parts(elapsed_secs)?;
                 Some(format!("{main}{suffix}"))
             }
@@ -204,7 +207,6 @@ impl Turn {
                     )
                 })
             }
-            TurnPhase::Tool => None,
             TurnPhase::AssistantText => {
                 let tokens = self.tokens();
                 (!tokens.is_empty()).then_some(tokens)
@@ -389,7 +391,9 @@ mod tests {
         assert_eq!(turn.label(0).as_deref(), Some("Thinking (0s)"));
 
         turn.phase = TurnPhase::Tool;
-        assert_eq!(turn.label(1), None, "the focused group owns tool activity");
+        // The reference keeps the Thinking clock ticking below the
+        // transient tool row.
+        assert_eq!(turn.label(1).as_deref(), Some("Thinking (1s)"));
 
         turn.input = 1_000;
         turn.output = 20;

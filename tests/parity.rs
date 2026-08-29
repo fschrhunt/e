@@ -182,6 +182,53 @@ fn lists_match_the_reference_glyphs_and_indent() {
 }
 
 #[test]
+fn tables_render_the_reference_boxed_ladder() {
+    let t = dark();
+    // Fits the frame → the boxed grid: ┌┬┐ top, padded cells, ├┼┤ after the
+    // header and between every body row, └┴┘ bottom.
+    let out = render_markdown(&t, "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n", 80);
+    assert_eq!(out[0], "┌───┬───┐");
+    assert!(
+        out[1].contains("│ ") && out[1].contains("\x1b[1ma\x1b[22m"),
+        "{:?}",
+        out[1]
+    );
+    assert_eq!(out[2], "├───┼───┤");
+    assert_eq!(out[3], "│ 1 │ 2 │");
+    assert_eq!(out[4], "├───┼───┤", "a separator rides between body rows");
+    assert_eq!(out[5], "│ 3 │ 4 │");
+    assert_eq!(out[6], "└───┴───┘");
+
+    // A header cell's inline bold re-asserts the row bold after its close.
+    let strong = render_markdown(&t, "| prefix **strong** suffix |\n|---|\n| value |\n", 80);
+    assert!(
+        strong
+            .iter()
+            .any(|l| l.contains("\x1b[1mprefix \x1b[1mstrong\x1b[22m\x1b[1m suffix\x1b[22m")),
+        "{strong:?}"
+    );
+
+    // Too wide for the grid → the vertical key/value box at frame width.
+    let vertical = render_markdown(
+        &t,
+        "| name | detail |\n|---|---|\n| one | aaaaaaaaaa |\n| two | bbbbbbbbbb |\n",
+        16,
+    );
+    assert_eq!(vertical[0], "┌──────────────┐");
+    assert!(
+        vertical
+            .iter()
+            .any(|l| l.starts_with("│") && l.contains("name: one")),
+        "{vertical:?}"
+    );
+    assert!(
+        vertical.iter().any(|l| l == "├──────────────┤"),
+        "records separate: {vertical:?}"
+    );
+    assert_eq!(vertical.last().unwrap(), "└──────────────┘");
+}
+
+#[test]
 fn wrapping_reopens_styles_and_avoids_orphans() {
     use e::tui::markdown::wrap_styled;
     // A bold span crossing a seam closes at the row end and reopens on the
@@ -238,9 +285,10 @@ fn inline_spans_match_the_reference() {
     assert!(out.contains("\x1b[1mbold\x1b[22m"));
     // Inline code: the palette's dedicated inline-code gray (dim var = 245 dark).
     assert!(out.contains("\x1b[38;5;245mcode\x1b[39m"), "{out:?}");
-    // Links: underline only, OSC 8 wrapped, no printed URL.
+    // Links: underline only, OSC 8 wrapped with a document-scoped id (so a
+    // wrapped link stays one link), no printed URL.
     assert!(
-        out.contains("\x1b]8;;https://x.dev\x1b\\\x1b[4mlink\x1b[24m\x1b]8;;\x1b\\"),
+        out.contains("\x1b]8;id=e-1;https://x.dev\x1b\\\x1b[4mlink\x1b[24m\x1b]8;;\x1b\\"),
         "{out:?}"
     );
     assert!(!out.contains("(https://x.dev)"));
@@ -398,12 +446,19 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     assert_eq!(group.text, "2 tool calls · 1 read · 1 command");
 
     group.start_tool(1);
+    // The focused running call paints as the transient overlay row, not a
+    // tree row; the still-pending sibling shows nowhere yet.
     let running = group.lines_for_test(&theme, 80);
-    assert!(running[1].contains("Reading src/core/mod.rs"));
-    assert!(!running.iter().any(|line| line.contains("cargo test")));
-    let narrow = group.lines_for_test(&theme, 20);
+    assert_eq!(running.len(), 1, "only the header while the call runs");
+    let overlay = group.overlay_rows(&theme, 80, true);
     assert!(
-        narrow[1].contains('…'),
+        overlay[0].contains("Reading src/core/mod.rs"),
+        "{overlay:?}"
+    );
+    assert!(!running.iter().any(|line| line.contains("cargo test")));
+    let narrow = group.overlay_rows(&theme, 20, true);
+    assert!(
+        narrow[0].contains('…'),
         "long targets need an explicit ellipsis"
     );
 
@@ -415,12 +470,18 @@ fn live_tool_group_replaces_running_state_and_streams_output() {
     );
     group.start_tool(2);
     group.append_tool_output(2, "one\ntwo\nthree\nfour\nfive\nsix\n");
+    // The finished call keeps `├` — the tree stays open while the focused
+    // call is out — and the live output streams under the overlay row.
     let streaming = group.lines_for_test(&theme, 80);
     assert!(streaming[1].contains("Read src/core/mod.rs"));
-    assert!(streaming[2].contains("Running cargo test"));
-    assert!(streaming.iter().any(|line| line.contains("one")));
+    assert!(streaming[1].contains('├'), "{:?}", streaming[1]);
+    assert!(!streaming.iter().any(|line| line.contains("cargo test")));
+    let overlay = group.overlay_rows(&theme, 80, true);
+    assert!(overlay[0].contains("Running cargo test"));
+    assert!(overlay[0].contains('└'), "a tree's focused call wears └");
+    assert!(overlay.iter().any(|line| line.contains("one")));
     // The reference pluralizes the elision row: one hidden line is a "line".
-    assert!(streaming
+    assert!(overlay
         .last()
         .unwrap()
         .contains("1 line more (ctrl o to view)"));
@@ -470,12 +531,15 @@ fn running_write_and_edit_rows_stay_lean() {
         "src/lib.rs".into(),
     )]);
     group.start_tool(1);
-    // A write streams no inline content: the tree says "Writing src/lib.rs"
-    // and nothing more — the thinking indicator row is not displaced by a
-    // file dump. (Full content still lands behind ctrl+o.)
+    // A write streams no inline content: the overlay says "Writing
+    // src/lib.rs" and nothing more — no file dump. (Full content still
+    // lands behind ctrl+o.)
     group.append_tool_output(1, "hello\nworld\n");
+    let overlay = group.overlay_rows(&theme, 80, true);
+    assert!(overlay[0].contains("Writing src/lib.rs"), "{overlay:?}");
+    assert!(overlay[0].contains('●'), "a lone call wears the ● marker");
+    assert!(!overlay.iter().any(|line| line.contains('│')));
     let rows = group.lines_for_test(&theme, 80);
-    assert!(rows[1].contains("Writing src/lib.rs"));
     assert!(!rows.iter().any(|line| line.contains('│')));
 
     // Edits are the same; the completion summary rides the row itself.
@@ -524,8 +588,9 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
     assert_eq!(t.blocks[2].text, "1 tool call \u{b7} 1 read");
 
     // The reference never caps the tree: every started call keeps its row
-    // and the header carries the full tallies. (Rows render once a call
-    // leaves its pending state, so start them.)
+    // and the header carries the full tallies. The latest running call is
+    // the focused one — out of the tree, on the overlay. (Rows render once
+    // a call leaves its pending state, so start them.)
     let many = (0..12).map(|i| read(10 + i, &format!("{i}.rs"))).collect();
     t.extend_tool_group(many);
     assert_eq!(t.blocks[2].text, "13 tool calls \u{b7} 13 read");
@@ -533,9 +598,19 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
         t.blocks[2].start_tool(id);
     }
     let rows = t.blocks[2].lines_for_test(&theme, 80);
-    assert_eq!(rows.len(), 1 + 13, "header plus every started call");
+    assert_eq!(
+        rows.len(),
+        1 + 12,
+        "header plus every started call but the focused one"
+    );
     assert!(rows[1].contains("Reading c.rs"));
-    assert!(rows.last().unwrap().contains("Reading 11.rs"));
+    assert!(rows.last().unwrap().contains("Reading 10.rs"));
+    assert!(
+        !rows.iter().any(|line| line.contains('└')),
+        "the tree stays open while the focused call is out"
+    );
+    let overlay = t.blocks[2].overlay_rows(&theme, 80, true);
+    assert!(overlay[0].contains("Reading 11.rs"), "{overlay:?}");
     assert!(!rows.iter().any(|line| line.contains("earlier tool calls")));
 }
 
@@ -597,6 +672,125 @@ fn picker_band_shrinks_with_its_rows() {
 }
 
 #[test]
+fn footnotes_number_by_first_use_and_flush_dim_definitions() {
+    let theme = e::tui::theme::resolve("dark", false);
+    let md = "First[^b] then[^a].\n\n[^a]: alpha note\n[^b]: beta note";
+    let out = render_markdown(&theme, md, 80);
+    let joined = out.join("\n");
+    // References number by first use, dim.
+    assert!(joined.contains(&theme.fg("dim", "[1]")), "{joined:?}");
+    // Definitions flush at the end in number order, marker dim, body plain.
+    assert!(out.iter().any(|r| r.contains("beta note")), "{out:?}");
+    let beta = out.iter().position(|r| r.contains("beta note")).unwrap();
+    let alpha = out.iter().position(|r| r.contains("alpha note")).unwrap();
+    assert!(beta < alpha, "first-used note leads: {out:?}");
+    assert!(
+        out[beta].starts_with(&theme.fg("dim", "[1] ")),
+        "{:?}",
+        out[beta]
+    );
+    // A definition nobody references never prints.
+    let unused = render_markdown(&theme, "plain text\n\n[^x]: hidden", 80).join("\n");
+    assert!(!unused.contains("hidden"), "{unused:?}");
+}
+
+#[test]
+fn file_rows_segment_paths_the_reference_way() {
+    use e::tui::menu::project_path;
+    let plain = |width: usize, label: &str| -> String {
+        project_path(label, width).iter().map(|(c, _)| c).collect()
+    };
+    // A path that fits shows whole.
+    assert_eq!(
+        plain(40, "src/tui/surfaces/menu.rs"),
+        "src/tui/surfaces/menu.rs"
+    );
+    // Too long: the dirname middle-ellipsizes into its narrow budget
+    // (w/3 clamped to 3–12), the basename keeps its prefix-biased tail.
+    assert_eq!(plain(20, "src/tui/surfaces/menu.rs"), "src…es/menu.rs");
+    // Directories carry their trailing slash through every projection.
+    assert_eq!(plain(10, "src/core/providers/"), "s…e/pro…s/");
+    assert_eq!(plain(40, "src/"), "src/");
+    // Below the segmentation floor: basename alone, prefix-biased.
+    assert_eq!(plain(7, "deep/dir/some-name.rs"), "some-…s");
+}
+
+#[test]
+fn picker_tabs_follow_the_reference_grammar() {
+    use e::tui::menu::{degrade_hint, Menu, MenuItem, MenuKind, HINT_MODELS, HINT_SKILLS};
+    let theme = e::tui::theme::resolve("dark", false);
+    let mut items = vec![
+        MenuItem::new("alpha", "Global", "alpha"),
+        MenuItem::new("beta", "Workspace", "beta"),
+    ];
+    items[0].tab = Some(1);
+    items[1].tab = Some(2);
+    let mut menu = Menu::new(MenuKind::Skills, "Skills", HINT_SKILLS, items).with_tabs(
+        vec!["All".into(), "Global".into(), "Workspace".into()],
+        Some(0),
+        0,
+        "Source",
+    );
+    // The header brightens its `{title} {count}`, lays the tabs two spaces
+    // apart, and brackets only the active one; inactive tabs stay dim.
+    let rows = menu.render(&theme, 80);
+    assert!(rows[1].contains("Skills 2"), "{:?}", rows[1]);
+    assert!(rows[1].contains("[All]"), "{:?}", rows[1]);
+    assert!(rows[1].contains("\x1b[1m"), "{:?}", rows[1]);
+    assert!(
+        rows[1].contains(&theme.fg("dim", "Global")),
+        "{:?}",
+        rows[1]
+    );
+    assert_eq!(rows.len(), 2 + 4, "both skills under the All tab");
+
+    // Tab narrows to one source at a time; counts and rows follow.
+    menu.cycle_tab();
+    let global = menu.render(&theme, 80);
+    assert!(global[1].contains("[Global]"), "{:?}", global[1]);
+    assert!(global[1].contains("Skills 1"), "{:?}", global[1]);
+    assert_eq!(global.len(), 1 + 4);
+    menu.cycle_tab();
+    let workspace = menu.render(&theme, 80);
+    assert!(workspace[3].contains("beta"), "{:?}", workspace[3]);
+
+    // An empty narrower tab names the source it searched.
+    menu.set_query("alpha");
+    let empty = menu.render(&theme, 80);
+    assert!(
+        empty[3].contains("No Workspace skills found."),
+        "{:?}",
+        empty[3]
+    );
+
+    // The model picker degrades by windowing its tabs around the active
+    // one, marking a clipped end with a dim ellipsis.
+    let mut models = vec![
+        MenuItem::new("a-model", "", "a"),
+        MenuItem::new("b-model", "", "b"),
+    ];
+    models[0].tab = Some(1);
+    models[1].tab = Some(2);
+    let models = Menu::new(MenuKind::Models, "Models", HINT_MODELS, models).with_tabs(
+        vec!["All".into(), "Anthropic".into(), "OpenAI".into()],
+        Some(0),
+        0,
+        "",
+    );
+    let narrow = models.render(&theme, 20);
+    assert!(narrow[1].contains("[All]"), "{:?}", narrow[1]);
+    assert!(narrow[1].contains('…'), "{:?}", narrow[1]);
+    assert!(!narrow[1].contains("Anthropic"), "{:?}", narrow[1]);
+
+    // The hints degrade stepwise through the reference's ladders.
+    assert_eq!(
+        degrade_hint(HINT_SKILLS, 45),
+        "↑↓ Navigate  Tab Source  Enter Use  Esc Close"
+    );
+    assert_eq!(degrade_hint(HINT_MODELS, 12), "Enter Esc");
+}
+
+#[test]
 fn question_panel_frames_options_with_brightness_selection() {
     use e::tui::questionpanel::Question;
     let theme = e::tui::theme::resolve("dark", false);
@@ -628,6 +822,43 @@ fn question_panel_frames_options_with_brightness_selection() {
     q.freeform = "teal".into();
     assert_eq!(q.answer().as_deref(), Some("teal"));
     assert!(q.hint().starts_with("Type answer"));
+}
+
+#[test]
+fn review_projection_shows_every_child_with_its_detail_link() {
+    use e::tui::transcript::{Block, ToolChild};
+    let theme = e::tui::theme::resolve("dark", false);
+    let mut group = Block::tool_group(vec![
+        ToolChild::pending(
+            1,
+            "read".into(),
+            "Reading".into(),
+            "Read".into(),
+            "a.rs".into(),
+        ),
+        ToolChild::pending(
+            2,
+            "read".into(),
+            "Reading".into(),
+            "Read".into(),
+            "b.rs".into(),
+        ),
+    ]);
+    group.start_tool(1);
+    group.finish_tool(1, e::core::tools::ToolOutcome::Completed, "done".into(), "");
+    group.tool_children[0].detail = Some(41);
+    group.start_tool(2);
+
+    // The review screen has no overlay: the focused running call keeps a
+    // row here, the last child wears └, and finished rows carry their
+    // stored-detail id for the splice.
+    let rows = group.review_lines(&theme, 80);
+    assert_eq!(rows.len(), 3);
+    assert!(rows[1].0.contains("Read a.rs"));
+    assert_eq!(rows[1].1, Some(41));
+    assert!(rows[2].0.contains("Reading b.rs"), "{:?}", rows[2].0);
+    assert!(rows[2].0.contains('└'));
+    assert_eq!(rows[2].1, None);
 }
 
 #[test]

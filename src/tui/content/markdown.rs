@@ -27,8 +27,10 @@ use crate::tui::highlight::{highlight_block, infer_language};
 use crate::tui::render::*;
 use crate::tui::theme::Theme;
 
-fn osc8(url: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\")
+/// A link open carrying a document-scoped id, so a link split across
+/// wrapped rows stays one link in id-aware terminals.
+fn osc8_id(id: u64, url: &str) -> String {
+    format!("\x1b]8;id=e-{id};{url}\x1b\\")
 }
 const OSC8_CLOSE: &str = "\x1b]8;;\x1b\\";
 
@@ -140,6 +142,8 @@ struct StyleState {
     underline: bool,
     strike: bool,
     fg: Option<String>,
+    /// The open hyperlink's raw OSC 8 payload (`params;uri`), kept whole so
+    /// a reopen carries the same id and the halves stay one link.
     link: Option<String>,
 }
 
@@ -184,7 +188,7 @@ impl StyleState {
                         self.link = if uri.is_empty() {
                             None
                         } else {
-                            Some(uri.to_string())
+                            Some(rest.to_string())
                         };
                     }
                 }
@@ -228,8 +232,8 @@ impl StyleState {
     /// The sequences reopening this state at a row start.
     fn opens(&self) -> String {
         let mut out = String::new();
-        if let Some(link) = &self.link {
-            out.push_str(&osc8(link));
+        if let Some(payload) = &self.link {
+            out.push_str(&format!("\x1b]8;{payload}\x1b\\"));
         }
         if self.bold {
             out.push_str(BOLD_ON);
@@ -612,7 +616,7 @@ fn flush_item(
 
 /// Append text to the inline run, autolinking bare http(s) URLs the
 /// reference way: underline + OSC 8, trailing `.,;:!?` left outside.
-fn push_text_autolinked(inline: &mut String, text: &str) {
+fn push_text_autolinked(inline: &mut String, text: &str, link_seq: &mut u64) {
     let mut rest = text;
     loop {
         let Some(found) = rest.match_indices("http").map(|(i, _)| i).find(|&i| {
@@ -643,7 +647,8 @@ fn push_text_autolinked(inline: &mut String, text: &str) {
             // A bare scheme is text, not a link; so is an invalid URL.
             inline.push_str(&tail[..end]);
         } else {
-            inline.push_str(&osc8(url));
+            *link_seq += 1;
+            inline.push_str(&osc8_id(*link_seq, url));
             inline.push_str(UNDERLINE_ON);
             inline.push_str(url);
             inline.push_str(UNDERLINE_OFF);
@@ -660,6 +665,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
     let parser = Parser::new_ext(markdown, opts);
 
     let mut out: Vec<String> = Vec::new();
@@ -686,13 +692,60 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
     // Whether the open link/image actually emitted an OSC 8 open (a URL
     // that failed validation did not, so its end must not close one).
     let mut link_hot = false;
+    let mut link_seq = 0u64;
     let mut image_mark: Option<usize> = None;
     let mut code: Option<(String, String)> = None; // (lang, buffer)
     #[allow(clippy::type_complexity)]
     let mut table: Option<(Vec<String>, Vec<Vec<String>>, Vec<Alignment>, bool)> = None;
+    // Footnotes, the reference grammar: `[^label]` renders as a dim `[N]`
+    // numbered by first use; definitions collect out of the flow and flush
+    // at the end, `[N] `-marked with a hanging indent. A definition nobody
+    // references never prints; a reference nobody defines keeps its mark.
+    let mut footnotes: Vec<(String, Option<usize>, String)> = Vec::new();
+    let mut next_footnote = 0usize;
+    let mut open_footnote: Option<usize> = None;
 
     for (event, range) in parser.into_offset_iter() {
         match event {
+            Event::FootnoteReference(label) => {
+                let index = footnotes
+                    .iter()
+                    .position(|(l, ..)| *l == *label)
+                    .unwrap_or_else(|| {
+                        footnotes.push((label.to_string(), None, String::new()));
+                        footnotes.len() - 1
+                    });
+                let number = *footnotes[index].1.get_or_insert_with(|| {
+                    next_footnote += 1;
+                    next_footnote
+                });
+                inline.push_str(&theme.fg("dim", &format!("[{number}]")));
+            }
+            Event::Start(Tag::FootnoteDefinition(label)) => {
+                let index = footnotes
+                    .iter()
+                    .position(|(l, ..)| *l == *label)
+                    .unwrap_or_else(|| {
+                        footnotes.push((label.to_string(), None, String::new()));
+                        footnotes.len() - 1
+                    });
+                open_footnote = Some(index);
+                inline.clear();
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                open_footnote = None;
+                inline.clear();
+            }
+            Event::End(TagEnd::Paragraph) if open_footnote.is_some() => {
+                if let Some(index) = open_footnote {
+                    let note = &mut footnotes[index];
+                    if !note.2.is_empty() {
+                        note.2.push('\n');
+                    }
+                    note.2.push_str(&inline);
+                }
+                inline.clear();
+            }
             Event::Start(Tag::Heading { level, .. }) => {
                 heading = Some(match level {
                     HeadingLevel::H1 => 1,
@@ -848,7 +901,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             }
             Event::End(TagEnd::Table) => {
                 if let Some((header, rows, aligns, _)) = table.take() {
-                    push_block(&mut out, render_table(&header, &rows, &aligns));
+                    push_block(&mut out, render_table(&header, &rows, &aligns, width));
                 }
             }
             Event::Rule => push_block(&mut out, vec![rule()]),
@@ -870,7 +923,8 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                 // sequence; its label renders as plain underlined text.
                 link_hot = valid_link_url(&dest_url);
                 if link_hot {
-                    inline.push_str(&osc8(&dest_url));
+                    link_seq += 1;
+                    inline.push_str(&osc8_id(link_seq, &dest_url));
                 }
                 inline.push_str(UNDERLINE_ON);
             }
@@ -890,7 +944,8 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                 in_link = true;
                 link_hot = valid_link_url(&dest_url);
                 if link_hot {
-                    inline.push_str(&osc8(&dest_url));
+                    link_seq += 1;
+                    inline.push_str(&osc8_id(link_seq, &dest_url));
                 }
                 inline.push_str(UNDERLINE_ON);
                 inline.push_str("▧ ");
@@ -914,7 +969,7 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
                 } else if in_link || heading.is_some() {
                     inline.push_str(&text);
                 } else {
-                    push_text_autolinked(&mut inline, &text);
+                    push_text_autolinked(&mut inline, &text, &mut link_seq);
                 }
             }
             // The reference preserves the author's line breaks: a soft break
@@ -925,68 +980,192 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             _ => {}
         }
     }
+    // Referenced, defined footnotes close the message in number order.
+    let mut used: Vec<(usize, &String)> = footnotes
+        .iter()
+        .filter_map(|(_, number, body)| number.filter(|_| !body.is_empty()).map(|n| (n, body)))
+        .collect();
+    used.sort_by_key(|(n, _)| *n);
+    let mut note_rows: Vec<String> = Vec::new();
+    for (number, body) in used {
+        let marker = format!("[{number}] ");
+        let hang = " ".repeat(marker.chars().count());
+        let body_width = width.saturating_sub(marker.chars().count()).max(8);
+        let mut first = true;
+        for line in body.split('\n') {
+            for row in wrap_styled(line, body_width) {
+                let lead = if first {
+                    theme.fg("dim", &marker)
+                } else {
+                    hang.clone()
+                };
+                first = false;
+                note_rows.push(format!("{lead}{row}"));
+            }
+        }
+    }
+    push_block(&mut out, note_rows);
     out
 }
 
-/// Table: plain ` │ ` separators and `─┼─` junctions (the reference leaves
-/// them undimmed), a bold header row, `:---:` alignment honored with the
-/// header always left.
-fn render_table(header: &[String], rows: &[Vec<String>], aligns: &[Alignment]) -> Vec<String> {
-    let cols = header.len();
-    let mut widths: Vec<usize> = header.iter().map(|h| visible_width(h)).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < cols {
-                widths[i] = widths[i].max(visible_width(cell));
-            }
-        }
-    }
-    let pad_cell = |cell: &str, i: usize, force_left: bool| -> String {
-        let width = widths.get(i).copied().unwrap_or(0);
-        let gap = width.saturating_sub(visible_width(cell));
-        let align = if force_left {
-            Alignment::Left
-        } else {
-            aligns.get(i).copied().unwrap_or(Alignment::None)
-        };
-        match align {
-            Alignment::Right => format!("{}{cell}", " ".repeat(gap)),
-            Alignment::Center => {
-                let left = gap / 2;
-                format!("{}{cell}{}", " ".repeat(left), " ".repeat(gap - left))
-            }
-            _ => format!("{cell}{}", " ".repeat(gap)),
-        }
-    };
-    let body_line = |cells: &[String]| -> String {
-        cells
-            .iter()
-            .enumerate()
-            .map(|(i, c)| pad_cell(c, i, false))
-            .collect::<Vec<_>>()
-            .join(" │ ")
-    };
-    // The header row is bold end to end; an inline bold span's own
-    // `\x1b[22m` reopens so it cannot switch the rest of the row off.
-    let header_cells = header
-        .iter()
-        .enumerate()
-        .map(|(i, c)| pad_cell(c, i, true))
-        .collect::<Vec<_>>()
-        .join(" │ ");
-    let mut out = vec![format!(
+/// The header cell's bold, the reference way: the cell's own inline
+/// `\x1b[22m` re-asserts bold so a nested span cannot switch the rest of
+/// the header off; padding stays outside the bold run.
+fn table_header_cell(cell: &str) -> String {
+    format!(
         "{BOLD_ON}{}{WEIGHT_OFF}",
-        header_cells.replace(WEIGHT_OFF, "\x1b[22m\x1b[1m")
-    )];
-    out.push(
-        widths
-            .iter()
-            .map(|w| "─".repeat(*w))
-            .collect::<Vec<_>>()
-            .join("─┼─"),
-    );
-    for row in rows {
-        out.push(body_line(row));
+        cell.replace(WEIGHT_OFF, "\x1b[22m\x1b[1m")
+    )
+}
+
+fn table_border(left: &str, middle: &str, right: &str, widths: &[usize]) -> String {
+    let mut out = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            out.push_str(middle);
+        }
+        out.push_str(&"─".repeat(width + 2));
     }
+    out.push_str(right);
+    out
+}
+
+/// One `│…│` field row of the vertical layout, wrapping at the inner width
+/// (escapes ride along at zero columns); a glyph too wide for the whole
+/// column renders as `?`.
+fn table_vertical_lines(out: &mut Vec<String>, content: &str, inner_width: usize) {
+    if content.is_empty() {
+        out.push(format!("│{}│", " ".repeat(inner_width)));
+        return;
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut row = String::new();
+        let mut used = 0usize;
+        let start = i;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '\x1b' {
+                // Copy the whole escape sequence at zero columns.
+                row.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let n = chars[i];
+                    row.push(n);
+                    i += 1;
+                    if n.is_ascii_alphabetic() || n == '\\' || n == '\x07' {
+                        break;
+                    }
+                }
+                continue;
+            }
+            let w = c.width().unwrap_or(0);
+            if used + w > inner_width {
+                break;
+            }
+            row.push(c);
+            used += w;
+            i += 1;
+        }
+        if i == start {
+            // A single glyph wider than the whole column: substitute.
+            row.push('?');
+            used = 1.min(inner_width);
+            i += 1;
+        }
+        out.push(format!(
+            "│{row}{}│",
+            " ".repeat(inner_width.saturating_sub(used))
+        ));
+    }
+}
+
+/// The reference's transcript table ladder: a boxed grid (`┌┬┐`, padded
+/// cells, `├┼┤` after the header and between every body row, `└┴┘`) when it
+/// fits the frame; a vertical `header: value` box at exactly the frame's
+/// width when it doesn't; bare clipped `header: value` lines below three
+/// columns. `:---:` alignment holds in the grid, the header always left.
+fn render_table(
+    header: &[String],
+    rows: &[Vec<String>],
+    aligns: &[Alignment],
+    cols: usize,
+) -> Vec<String> {
+    let ncols = header.len();
+    let mut out = Vec::new();
+    if cols <= 2 {
+        for row in rows {
+            for (col, name) in header.iter().enumerate().take(ncols) {
+                let value = row.get(col).map(String::as_str).unwrap_or("");
+                let field = format!("{name}: {value}");
+                out.push(clip_styled(&field, cols));
+            }
+        }
+        return out;
+    }
+    let mut widths = vec![0usize; ncols];
+    for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
+        for (col, cell) in row.iter().enumerate() {
+            if col < ncols {
+                widths[col] = widths[col].max(visible_width(cell));
+            }
+        }
+    }
+    let grid_width = ncols * 3 + 1 + widths.iter().sum::<usize>();
+    if ncols > 0 && grid_width <= cols {
+        out.push(table_border("┌", "┬", "┐", &widths));
+        let all_rows: Vec<&[String]> = std::iter::once(header)
+            .chain(rows.iter().map(Vec::as_slice))
+            .collect();
+        for (row_index, row) in all_rows.iter().enumerate() {
+            let mut line = String::from("│");
+            for (col, width) in widths.iter().enumerate() {
+                let cell = row.get(col).map(String::as_str).unwrap_or("");
+                let pad = width.saturating_sub(visible_width(cell));
+                let align = if row_index == 0 {
+                    Alignment::Left
+                } else {
+                    aligns.get(col).copied().unwrap_or(Alignment::None)
+                };
+                let left_pad = match align {
+                    Alignment::Right => pad,
+                    Alignment::Center => pad / 2,
+                    _ => 0,
+                };
+                line.push(' ');
+                line.push_str(&" ".repeat(left_pad));
+                if row_index == 0 {
+                    line.push_str(&table_header_cell(cell));
+                } else {
+                    line.push_str(cell);
+                }
+                line.push_str(&" ".repeat(pad - left_pad));
+                line.push_str(" │");
+            }
+            out.push(line);
+            let last = row_index + 1 == all_rows.len();
+            if (row_index == 0 && all_rows.len() > 1) || (row_index > 0 && !last) {
+                out.push(table_border("├", "┼", "┤", &widths));
+            }
+        }
+        out.push(table_border("└", "┴", "┘", &widths));
+        return out;
+    }
+    // Vertical fallback: one record per body row, `header: value` fields
+    // boxed at exactly the frame's width.
+    let inner_width = cols - 2;
+    out.push(format!("┌{}┐", "─".repeat(inner_width)));
+    for (row_index, row) in rows.iter().enumerate() {
+        for (col, name) in header.iter().enumerate().take(ncols) {
+            let value = row.get(col).map(String::as_str).unwrap_or("");
+            let field = format!("{name}: {value}");
+            table_vertical_lines(&mut out, &field, inner_width);
+        }
+        if row_index + 1 < rows.len() {
+            out.push(format!("├{}┤", "─".repeat(inner_width)));
+        }
+    }
+    out.push(format!("└{}┘", "─".repeat(inner_width)));
     out
 }

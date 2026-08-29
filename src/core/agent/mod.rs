@@ -364,6 +364,10 @@ pub struct Agent {
     events: mpsc::Sender<SessionEvent>,
     /// Messages typed while a turn runs (steered or queued per settings).
     pending: Arc<Mutex<Vec<String>>>,
+    /// While true the turn loop leaves `pending` untouched — the queued-
+    /// prompt review is editing it; the turn holds open at its end until
+    /// the review closes.
+    queue_paused: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     running: bool,
     /// The session log; every committed message is appended.
@@ -404,6 +408,7 @@ impl Agent {
             history: Arc::new(Mutex::new(Vec::new())),
             events,
             pending: Arc::new(Mutex::new(Vec::new())),
+            queue_paused: Arc::new(AtomicBool::new(false)),
             cancel: Arc::new(AtomicBool::new(false)),
             running: false,
             session: Arc::new(Mutex::new(None)),
@@ -598,6 +603,27 @@ impl Agent {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// The queued prompts, oldest first — the review edits a copy and
+    /// writes it back through [`Agent::set_queued`].
+    pub fn queued(&self) -> Vec<String> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Replace the queue wholesale (the review committing its edits).
+    pub fn set_queued(&self, items: Vec<String>) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = items;
+    }
+
+    /// Pause or resume queue draining. Paused, the turn loop neither
+    /// steers pending prompts into the turn nor ends while any remain —
+    /// it holds open until the review releases them.
+    pub fn pause_queue(&self, paused: bool) {
+        self.queue_paused.store(paused, Ordering::SeqCst);
+    }
+
     /// Resolve a waiting ask-tool call: `Some(text)` is the user's answer,
     /// `None` a dismissal (the tool records it as cancelled). Unknown ids —
     /// a stale panel after Esc aborted the turn — are a no-op.
@@ -667,6 +693,7 @@ impl Agent {
         let cwd = self.cwd.clone();
         let effort = self.effort();
         let pending = self.pending.clone();
+        let queue_paused = self.queue_paused.clone();
         let host = self.host.clone();
         let tool_seq = self.tool_seq.clone();
         let wake = self.wake.clone();
@@ -716,8 +743,11 @@ impl Agent {
                         .await;
                     break false;
                 }
-                // Steer: fold any pending messages into this turn between steps.
-                let steered: Vec<String> = {
+                // Steer: fold any pending messages into this turn between
+                // steps — unless the queued-prompt review holds them.
+                let steered: Vec<String> = if queue_paused.load(Ordering::SeqCst) {
+                    Vec::new()
+                } else {
                     pending
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1183,11 +1213,20 @@ impl Agent {
                 if calls.is_empty() {
                     // A plain reply would end the turn — but a message that
                     // landed mid-reply must still be delivered, so continue the
-                    // turn to pick it up rather than stranding it.
-                    if !pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-                        continue;
+                    // turn to pick it up rather than stranding it. While the
+                    // queued-prompt review holds the queue, the turn holds
+                    // open here instead of consuming or stranding it.
+                    loop {
+                        if pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                            break 'turn false;
+                        }
+                        if !queue_paused.load(Ordering::SeqCst) {
+                            continue 'turn;
+                        }
+                        if !sleep_cancellable(Duration::from_millis(100), &cancel).await {
+                            break 'turn true;
+                        }
                     }
-                    break false;
                 }
 
                 // Resolve the complete batch before serial execution so the
