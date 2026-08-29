@@ -985,6 +985,10 @@ impl Agent {
                                     max_attempts,
                                     err.message
                                 )
+                            } else if err.cause == FailureCause::QuotaExhausted {
+                                // Lead with the why: the raw body behind it
+                                // is provider JSON the row will never show.
+                                format!("{} — {}", err.cause.label(), err.message)
                             } else {
                                 err.message
                             };

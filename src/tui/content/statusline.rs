@@ -56,11 +56,11 @@ fn clip(s: &str, max_chars: usize) -> String {
 /// re-exported under its long-standing name.
 pub use crate::core::output::format_elapsed;
 
-/// Per-turn token flow and focused activity phase. Both counters come from
-/// real provider usage frames only — nothing is estimated from streamed
-/// bytes. Invisible reasoning tokens are real output and reach `output`
-/// when the step's usage lands, so the display never balloons ahead of the
-/// truth (pi's model).
+/// Per-turn token flow and focused activity phase. The display moves only
+/// on real provider usage frames — streamed bytes are never estimated into
+/// it, so invisible reasoning tokens can't balloon the numbers ahead of the
+/// truth (pi's model). `input` starts as a chars/4 seed of the request size
+/// until the first usage frame lands; `output` is real tokens only.
 pub struct Turn {
     /// Latest request's full context, from real usage (a chars/4 seed until
     /// the first report lands).

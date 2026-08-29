@@ -1832,3 +1832,48 @@ async fn anthropic_model_refresh_speaks_the_messages_dialect() {
         .iter()
         .any(|m| m.provider == "anthropic" && m.id.contains("embed")));
 }
+
+/// The completions dialect carries the model's effort knob on the
+/// OpenAI-standard `reasoning_effort` field — sent whenever the agent
+/// resolved one, absent when there is none or the knob is `off` (which has
+/// no wire encoding here). This was the one dialect silently dropping it.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn completions_send_reasoning_effort_when_the_model_has_a_knob() {
+    let _lock = env_lock();
+    let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    let stream = |effort: Option<&'static str>| async move {
+        let (port, server) = serve_sse(&[sse]);
+        let home = Home::new(&format!("effort-{}", effort.unwrap_or("none")));
+        home.auth(r#"{"mock":{"key":"k"}}"#);
+        let model = test_model("mock", port, Api::Completions);
+        let request = Request {
+            model,
+            system: "sys".into(),
+            messages: vec![ChatMessage::user("hi")],
+            effort: effort.map(str::to_string),
+            tools: Vec::new(),
+        };
+        collect_stream(request).await;
+        server.join().unwrap().remove(0)
+    };
+
+    let sent = stream(Some("low")).await;
+    assert_eq!(
+        request_json(&sent)["reasoning_effort"],
+        "low",
+        "resolved effort must reach the completions wire: {sent}"
+    );
+
+    let sent = stream(None).await;
+    assert!(
+        request_json(&sent).get("reasoning_effort").is_none(),
+        "a model with no knob must not send the field: {sent}"
+    );
+
+    let sent = stream(Some("off")).await;
+    assert!(
+        request_json(&sent).get("reasoning_effort").is_none(),
+        "`off` has no completions encoding — absence is the closest thing: {sent}"
+    );
+}
