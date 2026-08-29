@@ -576,7 +576,7 @@ release notes are that section verbatim), open a fresh empty
 
 - Release notes now carry the version's changelog section and install
   instructions; `e docs models` documents env-var credentials and the
-  live catalog; ROADMAP records the 0.4 line.
+  live catalog.
 - Picker order: /models groups models by provider (registry order, live
   additions inline with their provider); /scoped-models lists the scoped
   entries first; ctrl+x on the scoped picker resets the scope entirely.
