@@ -390,8 +390,6 @@ pub fn wrap_styled(styled: &str, width: usize) -> Vec<String> {
     rows
 }
 
-const RESETS: &[&str] = &["\x1b[0m", "\x1b[39m", "\x1b[22m", "\x1b[24m"];
-
 /// Hard-wrap one code line, closing and reopening any open color at the seam.
 fn hard_wrap(line: &str, width: usize) -> Vec<String> {
     wrap_code_line(line, width, "")
@@ -407,7 +405,7 @@ fn wrap_code_line(line: &str, width: usize, indent: &str) -> Vec<String> {
     }
     let indent_width = indent.chars().count();
     let mut rows = Vec::new();
-    let mut open: Option<String> = None;
+    let mut state = StyleState::default();
     let mut row = String::new();
     let mut row_width = 0usize;
     let mut chars = line.chars().peekable();
@@ -421,11 +419,7 @@ fn wrap_code_line(line: &str, width: usize, indent: &str) -> Vec<String> {
                     break;
                 }
             }
-            open = if RESETS.contains(&seq.as_str()) {
-                None
-            } else {
-                Some(seq.clone())
-            };
+            state.advance(&seq);
             row.push_str(&seq);
             continue;
         }
@@ -446,6 +440,7 @@ fn wrap_code_line(line: &str, width: usize, indent: &str) -> Vec<String> {
                     break;
                 }
             }
+            state.advance(&seq);
             row.push_str(&seq);
             continue;
         }
@@ -456,27 +451,21 @@ fn wrap_code_line(line: &str, width: usize, indent: &str) -> Vec<String> {
             width.saturating_sub(indent_width).max(1)
         };
         if row_width + w > cap {
-            if open.is_some() {
-                row.push_str("\x1b[0m");
-            }
+            row.push_str(&state.closes());
             let finished = if rows.is_empty() {
                 std::mem::take(&mut row)
             } else {
                 format!("{indent}{}", std::mem::take(&mut row))
             };
             rows.push(finished);
-            if let Some(o) = &open {
-                row.push_str(o);
-            }
+            row.push_str(&state.opens());
             row_width = 0;
         }
         row.push(c);
         row_width += w;
     }
     if row_width > 0 || rows.is_empty() {
-        if open.is_some() {
-            row.push_str("\x1b[0m");
-        }
+        row.push_str(&state.closes());
         let finished = if rows.is_empty() {
             row
         } else {
@@ -688,10 +677,9 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
     let mut item_stack: Vec<bool> = Vec::new();
     let mut current_task: Option<bool> = None;
     let mut quote_depth = 0usize;
-    let mut in_link = false;
-    // Whether the open link/image actually emitted an OSC 8 open (a URL
-    // that failed validation did not, so its end must not close one).
-    let mut link_hot = false;
+    // Each open link or image keeps its OSC 8 opener. Images may nest inside
+    // links, so closing one must restore the parent's hyperlink and inline state.
+    let mut link_stack: Vec<Option<String>> = Vec::new();
     let mut link_seq = 0u64;
     let mut image_mark: Option<usize> = None;
     let mut code: Option<(String, String)> = None; // (lang, buffer)
@@ -819,7 +807,16 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             Event::End(TagEnd::List(_)) => {
                 lists.pop();
                 if lists.is_empty() {
-                    push_block(&mut out, std::mem::take(&mut item_first_lines));
+                    let lines = std::mem::take(&mut item_first_lines);
+                    if let Some(index) = open_footnote {
+                        let body = &mut footnotes[index].2;
+                        if !body.is_empty() && !lines.is_empty() {
+                            body.push('\n');
+                        }
+                        body.push_str(&lines.join("\n"));
+                    } else {
+                        push_block(&mut out, lines);
+                    }
                 }
             }
             Event::Start(Tag::Item) => {
@@ -866,7 +863,16 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((lang, buffer)) = code.take() {
-                    push_block(&mut out, code_panel(theme, &buffer, &lang, width));
+                    let lines = code_panel(theme, &buffer, &lang, width);
+                    if let Some(index) = open_footnote {
+                        let body = &mut footnotes[index].2;
+                        if !body.is_empty() && !lines.is_empty() {
+                            body.push('\n');
+                        }
+                        body.push_str(&lines.join("\n"));
+                    } else {
+                        push_block(&mut out, lines);
+                    }
                 }
             }
             Event::Start(Tag::Table(aligns)) => {
@@ -918,55 +924,78 @@ pub fn render_markdown(theme: &Theme, markdown: &str, width: usize) -> Vec<Strin
             Event::Start(Tag::Strikethrough) => inline.push_str(STRIKE_ON),
             Event::End(TagEnd::Strikethrough) => inline.push_str(STRIKE_OFF),
             Event::Start(Tag::Link { dest_url, .. }) => {
-                in_link = true;
                 // An oversized or control-laden URL never enters an OSC 8
                 // sequence; its label renders as plain underlined text.
-                link_hot = valid_link_url(&dest_url);
-                if link_hot {
+                let opener = if valid_link_url(&dest_url) {
                     link_seq += 1;
-                    inline.push_str(&osc8_id(link_seq, &dest_url));
-                }
-                inline.push_str(UNDERLINE_ON);
-            }
-            Event::End(TagEnd::Link) => {
-                in_link = false;
-                inline.push_str(UNDERLINE_OFF);
-                if link_hot {
+                    Some(osc8_id(link_seq, &dest_url))
+                } else {
+                    None
+                };
+                if link_stack.last().is_some_and(Option::is_some) {
                     inline.push_str(OSC8_CLOSE);
                 }
-                // An underlined heading level reopens its underline after
-                // the link closes its own.
-                if matches!(heading, Some(1) | Some(3) | Some(5)) {
+                if let Some(open) = &opener {
+                    inline.push_str(open);
+                }
+                inline.push_str(UNDERLINE_ON);
+                link_stack.push(opener);
+            }
+            Event::End(TagEnd::Link) => {
+                inline.push_str(UNDERLINE_OFF);
+                if link_stack.pop().flatten().is_some() {
+                    inline.push_str(OSC8_CLOSE);
+                }
+                if let Some(parent) = link_stack.last() {
+                    if let Some(open) = parent {
+                        inline.push_str(open);
+                    }
+                    inline.push_str(UNDERLINE_ON);
+                } else if matches!(heading, Some(1) | Some(3) | Some(5)) {
+                    // An underlined heading level reopens its underline after
+                    // the link closes its own.
                     inline.push_str(UNDERLINE_ON);
                 }
             }
             Event::Start(Tag::Image { dest_url, .. }) => {
-                in_link = true;
-                link_hot = valid_link_url(&dest_url);
-                if link_hot {
+                let opener = if valid_link_url(&dest_url) {
                     link_seq += 1;
-                    inline.push_str(&osc8_id(link_seq, &dest_url));
+                    Some(osc8_id(link_seq, &dest_url))
+                } else {
+                    None
+                };
+                if link_stack.last().is_some_and(Option::is_some) {
+                    inline.push_str(OSC8_CLOSE);
+                }
+                if let Some(open) = &opener {
+                    inline.push_str(open);
                 }
                 inline.push_str(UNDERLINE_ON);
+                link_stack.push(opener);
                 inline.push_str("▧ ");
                 image_mark = Some(inline.len());
             }
             Event::End(TagEnd::Image) => {
-                in_link = false;
                 // Empty alt text names the thing for what it is.
                 if image_mark.take() == Some(inline.len()) {
                     inline.push_str("image");
                 }
                 inline.push_str(UNDERLINE_OFF);
-                if link_hot {
+                if link_stack.pop().flatten().is_some() {
                     inline.push_str(OSC8_CLOSE);
+                }
+                if let Some(parent) = link_stack.last() {
+                    if let Some(open) = parent {
+                        inline.push_str(open);
+                    }
+                    inline.push_str(UNDERLINE_ON);
                 }
             }
             Event::Code(text) => inline.push_str(&theme.fg("mdCode", &text)),
             Event::Text(text) => {
                 if let Some((_, buffer)) = &mut code {
                     buffer.push_str(&text);
-                } else if in_link || heading.is_some() {
+                } else if !link_stack.is_empty() || heading.is_some() {
                     inline.push_str(&text);
                 } else {
                     push_text_autolinked(&mut inline, &text, &mut link_seq);

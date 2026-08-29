@@ -173,7 +173,7 @@ impl Block {
                 ToolOutcome::Blocked => ToolState::Blocked,
                 ToolOutcome::Cancelled => ToolState::Cancelled,
             };
-            child.result = Some(summary);
+            child.result = Some(crate::core::tools::sanitize_display(&summary));
             // Command output is the only thing the live preview draws; keep
             // it captured for a bash tool still running when a late finish
             // lands.
@@ -1050,6 +1050,31 @@ mod tests {
             collapsed[0].contains(theme.fg_prefix("dim")),
             "the collapsed row dims"
         );
+    }
+
+    #[test]
+    fn failed_tool_summary_is_sanitized_before_rendering() {
+        let mut block = Block::tool_group(vec![ToolChild::pending(
+            1,
+            "edit".into(),
+            "Editing".into(),
+            "Edited".into(),
+            "file.rs".into(),
+        )]);
+        block.finish_tool(
+            1,
+            ToolOutcome::Failed,
+            "bad \x1b[2Jreason\x1b]52;c;x\x07".into(),
+            "",
+        );
+        assert_eq!(block.tool_children[0].result.as_deref(), Some("bad reason"));
+        for row in block.lines_for_test(&theme(), 80) {
+            assert!(
+                !row.contains("\x1b[2J"),
+                "an erase sequence leaked: {row:?}"
+            );
+            assert!(!row.contains("\x1b]"), "an OSC sequence leaked: {row:?}");
+        }
     }
 
     /// Block text stays inert even for the thinking surface.

@@ -3,7 +3,7 @@
 //! row), the rail heads every visual row, and the cursor stays visible on the
 //! row it logically occupies.
 
-use e::tui::composer::Editor;
+use e::tui::composer::{Editor, Key};
 use e::tui::markdown::visible_width;
 use e::tui::theme;
 
@@ -74,7 +74,6 @@ fn up_down_move_between_visual_rows_and_fall_back_to_history() {
     editor.set_text("hello world extra");
     editor.render(&theme, 10, 24); // establishes the layout width
     let end = editor.cursor();
-    use e::tui::composer::Key;
     editor.key(Key::Up);
     assert!(editor.cursor() < end, "cursor moved up a visual row");
     assert_eq!(editor.text(), "hello world extra");
@@ -86,4 +85,19 @@ fn up_down_move_between_visual_rows_and_fall_back_to_history() {
     editor.render(&theme, 40, 24);
     editor.key(Key::Up);
     assert_eq!(editor.text(), "older");
+}
+
+#[test]
+fn paste_replaces_selection_and_clears_it() {
+    let mut editor = Editor::new();
+    editor.set_text("abcd");
+    editor.key(Key::SelectLeft);
+    editor.key(Key::SelectLeft);
+
+    editor.insert_paste("X");
+
+    assert_eq!(editor.text(), "abX");
+    assert_eq!(editor.cursor(), 3);
+    editor.key(Key::Left);
+    assert_eq!(editor.cursor(), 2, "paste must not leave a stale selection");
 }

@@ -662,14 +662,12 @@ impl App {
             return false;
         }
         let Some(mut review) = self.queue_review.take() else {
-            if code == KeyCode::Up
-                && self.editor.is_empty()
-                && self.active.is_some()
-                && self.agent.queued_count() > 0
-            {
-                self.agent.pause_queue(true);
-                let entries = self.agent.queued();
-                let selected = entries.len() - 1;
+            if code == KeyCode::Up && self.editor.is_empty() && self.active.is_some() {
+                let entries = self.agent.pause_queue();
+                let Some(selected) = entries.len().checked_sub(1) else {
+                    self.agent.resume_queue();
+                    return false;
+                };
                 let dirty = vec![false; entries.len()];
                 self.editor.set_text(&entries[selected]);
                 self.queue_review = Some(QueueReview {
@@ -736,7 +734,7 @@ impl App {
                     self.agent.set_queued(entries);
                 }
                 self.editor.set_text("");
-                self.agent.pause_queue(false);
+                self.agent.resume_queue();
                 return true;
             }
             KeyCode::Backspace if review.visible && self.editor.is_empty() => {
@@ -744,7 +742,7 @@ impl App {
                 review.dirty.remove(review.selected);
                 self.agent.set_queued(review.entries.clone());
                 if review.entries.is_empty() {
-                    self.agent.pause_queue(false);
+                    self.agent.resume_queue();
                     return true;
                 }
                 review.selected = review.selected.min(review.entries.len() - 1);
@@ -757,11 +755,12 @@ impl App {
         consumed
     }
 
-    /// Close the review without committing the visible draft — a new
-    /// prompt or a turn end resumes the queue as it stands.
+    /// Close the review without committing the visible draft. The draft is
+    /// discarded with the review, and the queue resumes as it stands.
     fn close_queue_review(&mut self) {
         if self.queue_review.take().is_some() {
-            self.agent.pause_queue(false);
+            self.editor.set_text("");
+            self.agent.resume_queue();
         }
     }
 
@@ -842,6 +841,8 @@ impl App {
     /// a fresh session.
     fn rebuild_transcript(&mut self, messages: &[crate::core::providers::ChatMessage]) {
         self.transcript.clear();
+        self.outputs.clear();
+        self.viewer = None;
         let mut restored_calls = std::collections::HashMap::<String, (usize, u64)>::new();
         let mut restored_id = 0u64;
         // Consecutive tool batches with no assistant voice between them were
@@ -1250,12 +1251,15 @@ impl App {
                      shift+tab cycles reasoning effort · ctrl+o opens full tool detail"
                         .into(),
                 );
-                self.menu = Some(crate::tui::menu::Menu::new(
-                    crate::tui::menu::MenuKind::Commands,
-                    "Commands",
-                    crate::tui::menu::HINT_USE,
-                    self.command_items(),
-                ));
+                self.menu = Some(
+                    crate::tui::menu::Menu::new(
+                        crate::tui::menu::MenuKind::Commands,
+                        "Commands",
+                        crate::tui::menu::HINT_USE,
+                        self.command_items(),
+                    )
+                    .without_trigger(),
+                );
             }
             "/new" | "/clear" => {
                 // A running turn owns the history and session log; replacing
@@ -1899,6 +1903,12 @@ fn rewind_target(
 /// swallows the chord, `None` means "not mentioned"); anything left
 /// unmentioned falls through to e's built-in bindings below, so an empty or
 /// missing file reproduces this function's behavior exactly.
+/// Question panels handle local input but leave global interrupt and exit keys alone.
+fn question_owns_key(event: &KeyEvent) -> bool {
+    let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
+    !(ctrl && matches!(event.code, KeyCode::Char('c') | KeyCode::Char('d')))
+}
+
 fn key_of(event: &KeyEvent, keymap: &crate::core::config::keybindings::Keymap) -> Option<Key> {
     let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
     let alt = event.modifiers.contains(KeyModifiers::ALT);
@@ -2234,8 +2244,8 @@ pub async fn run(
                                 }
                                 _ => {}
                             }
-                        } else if app.question.is_some() {
-                            // The ask tool's panel owns the keys while open.
+                        } else if app.question.is_some() && question_owns_key(&k) {
+                            // The ask tool's panel owns its local keys while open.
                             // Esc dismisses the question (the tool records a
                             // cancel) without aborting the turn; a digit
                             // chooses and answers in one stroke.
@@ -2903,6 +2913,16 @@ mod tests {
     static KEY_OF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn question_panel_leaves_global_interrupt_and_exit_keys_unhandled() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let plain_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(!question_owns_key(&ctrl_c));
+        assert!(!question_owns_key(&ctrl_d));
+        assert!(question_owns_key(&plain_c));
+    }
+
+    #[test]
     fn key_of_matches_the_built_in_bindings_when_the_keymap_is_empty() {
         let keymap = crate::core::config::keybindings::Keymap::empty();
         let ctrl_w = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
@@ -3161,6 +3181,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn queue_review_ignores_an_empty_synchronized_snapshot() {
+        let mut app = session_app();
+        app.on_session_event(SessionEvent::TurnStart);
+
+        assert!(!app.queue_review_key(KeyCode::Up));
+        assert!(app.queue_review.is_none());
+        assert!(app.editor.is_empty());
+    }
+
+    #[test]
+    fn cancelled_turn_discards_the_reviewed_prompt_from_composer() {
+        let mut app = session_app();
+        app.on_session_event(SessionEvent::TurnStart);
+        app.queue_review = Some(QueueReview {
+            entries: vec!["original".into()],
+            dirty: vec![false],
+            selected: 0,
+            visible: true,
+        });
+        app.editor.set_text("edited draft");
+
+        app.on_session_event(SessionEvent::TurnEnd { aborted: true });
+
+        assert!(app.queue_review.is_none());
+        assert!(app.editor.is_empty());
+    }
+
     fn thinking_flags(app: &App) -> Vec<(String, bool)> {
         app.transcript
             .blocks
@@ -3168,6 +3216,42 @@ mod tests {
             .filter(|block| block.kind == Kind::Thinking)
             .map(|block| (block.text.clone(), block.done))
             .collect()
+    }
+
+    #[test]
+    fn help_picker_filters_without_a_slash_trigger() {
+        let mut app = session_app();
+        app.submit_direct("/help".into());
+
+        app.editor.set_text("res");
+        app.sync_menu();
+        let menu = app
+            .menu
+            .as_ref()
+            .expect("help picker stays open while typing");
+        assert_eq!(
+            menu.current().map(|item| item.value.as_str()),
+            Some("/resume")
+        );
+
+        app.editor.set_text("vers");
+        app.sync_menu();
+        let menu = app
+            .menu
+            .as_ref()
+            .expect("help picker stays open after paste");
+        assert_eq!(
+            menu.current().map(|item| item.value.as_str()),
+            Some("/version")
+        );
+    }
+
+    #[test]
+    fn transcript_rebuild_discards_previous_output_details() {
+        let mut app = session_app();
+        app.remember_output("old session".into(), "old detail".into());
+        app.rebuild_transcript(&[]);
+        assert!(app.outputs.is_empty());
     }
 
     #[test]

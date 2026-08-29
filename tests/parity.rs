@@ -253,6 +253,18 @@ fn wrapping_reopens_styles_and_avoids_orphans() {
         "{:?}",
         rows[1]
     );
+
+    // A hard-wrapped token may have several active SGR attributes. Every one
+    // closes at the seam and reopens on the continuation row.
+    let styled = "\x1b[1m\x1b[3m\x1b[4m\x1b[9m\x1b[38;5;245mabcdefgh\x1b[0m";
+    let rows = wrap_styled(styled, 4);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows[0].ends_with("\x1b[0m"), "{:?}", rows[0]);
+    assert!(
+        rows[1].starts_with("\x1b[1m\x1b[3m\x1b[4m\x1b[9m\x1b[38;5;245m"),
+        "{:?}",
+        rows[1]
+    );
 }
 
 #[test]
@@ -292,6 +304,26 @@ fn inline_spans_match_the_reference() {
         "{out:?}"
     );
     assert!(!out.contains("(https://x.dev)"));
+}
+
+#[test]
+fn image_inside_link_restores_the_outer_hyperlink() {
+    let t = dark();
+    let out = render_markdown(
+        &t,
+        "[before ![alt](https://image.test/i.png) https://label.test](https://outer.test)",
+        120,
+    )
+    .join("\n");
+    let outer = "\x1b]8;id=e-1;https://outer.test\x1b\\";
+    let image_close = format!("\x1b[24m\x1b]8;;\x1b\\{outer}\x1b[4m https://label.test");
+
+    assert_eq!(out.matches(outer).count(), 2, "{out:?}");
+    assert!(out.contains(&image_close), "{out:?}");
+    assert!(
+        !out.contains("id=e-3"),
+        "outer label was autolinked: {out:?}"
+    );
 }
 
 #[test]
@@ -692,6 +724,32 @@ fn footnotes_number_by_first_use_and_flush_dim_definitions() {
     // A definition nobody references never prints.
     let unused = render_markdown(&theme, "plain text\n\n[^x]: hidden", 80).join("\n");
     assert!(!unused.contains("hidden"), "{unused:?}");
+}
+
+#[test]
+fn footnote_lists_and_code_stay_in_the_definition_body() {
+    let theme = e::tui::theme::resolve("dark", false);
+    let md = "Body[^n].\n\n[^n]: intro\n\n    - nested item\n\n    ```text\n    code line\n    ```";
+    let out = render_markdown(&theme, md, 80);
+    let note = out.iter().position(|row| row.contains("intro")).unwrap();
+    let item = out
+        .iter()
+        .position(|row| row.contains("nested item"))
+        .unwrap();
+    let code = out
+        .iter()
+        .position(|row| row.contains("code line"))
+        .unwrap();
+
+    assert!(note < item && item < code, "{out:?}");
+    assert!(
+        out[item].starts_with("    "),
+        "list escaped footnote: {out:?}"
+    );
+    assert!(
+        out[code].starts_with("    "),
+        "code escaped footnote: {out:?}"
+    );
 }
 
 #[test]

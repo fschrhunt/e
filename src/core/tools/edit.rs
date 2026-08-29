@@ -19,17 +19,17 @@ pub fn schema() -> Value {
 }
 
 pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
-    let err = |m: String| ToolOutput {
-        summary: super::failure_summary(&m),
+    let err = |m: String, target: &str| ToolOutput {
+        summary: super::failure_summary(&m, "edit", target),
         content: m,
         outcome: ToolOutcome::Failed,
         display: None,
     };
     let Some(path) = args["path"].as_str() else {
-        return err("edit: missing path".into());
+        return err("edit: missing path".into(), "");
     };
     let (Some(old), Some(new)) = (args["old_string"].as_str(), args["new_string"].as_str()) else {
-        return err("edit: missing old_string or new_string".into());
+        return err("edit: missing old_string or new_string".into(), "");
     };
     let full = resolve(cwd, path);
     if let Err(output) = super::require_regular_file(&full, "edit", path) {
@@ -43,16 +43,17 @@ pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
     }
     let text = match std::fs::read_to_string(&full) {
         Ok(t) => t,
-        Err(e) => return err(format!("edit {path}: {e}")),
+        Err(e) => return err(format!("edit {path}: {e}"), path),
     };
     let occurrences = text.matches(old).count();
     if occurrences == 0 {
-        return err(format!("edit {path}: old_string not found"));
+        return err(format!("edit {path}: old_string not found"), path);
     }
     if occurrences > 1 {
-        return err(format!(
-            "edit {path}: old_string occurs {occurrences} times; make it unique"
-        ));
+        return err(
+            format!("edit {path}: old_string occurs {occurrences} times; make it unique"),
+            path,
+        );
     }
     let updated = text.replacen(old, new, 1);
     match std::fs::write(&full, &updated) {
@@ -83,6 +84,6 @@ pub fn run(args: &Value, cwd: &Path) -> ToolOutput {
                 display: Some(super::truncate(detail.trim_end().to_string())),
             }
         }
-        Err(e) => err(format!("edit {path}: {e}")),
+        Err(e) => err(format!("edit {path}: {e}"), path),
     }
 }

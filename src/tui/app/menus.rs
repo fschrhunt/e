@@ -268,6 +268,16 @@ impl App {
         if self.pending_key.is_some() {
             return;
         }
+        // /help opens this picker after its slash command has already left the
+        // composer. In that mode all later composer input is the query.
+        if let Some(menu) = self
+            .menu
+            .as_mut()
+            .filter(|menu| menu.kind == MenuKind::Commands && menu.filter_without_trigger)
+        {
+            menu.set_query(text.strip_prefix('/').unwrap_or(&text));
+            return;
+        }
         // Slash picker: leading '/', no space yet.
         if text.starts_with('/') && !text.contains(' ') && !text.contains('\n') {
             let query = text[1..].to_string();

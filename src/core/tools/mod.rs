@@ -171,15 +171,16 @@ fn target_question(args: &Value) -> String {
     sanitize_inline(args["question"].as_str().unwrap_or(""))
 }
 
-/// The row-worthy reason inside a failure message: `edit x: old_string not
-/// found` → `old_string not found` — the reference's failed rows carry it
-/// (`Failed path: preflight failed`). A message with no colon rides whole.
-pub(crate) fn failure_summary(message: &str) -> String {
-    message
-        .split_once(": ")
-        .map(|(_, reason)| reason)
-        .unwrap_or(message)
-        .to_string()
+/// Extract the row-worthy reason after the exact tool/target prefix. Matching
+/// the known boundary keeps `: ` inside a path from becoming part of the
+/// reason rendered after that same path.
+pub(crate) fn failure_summary(message: &str, tool: &str, target: &str) -> String {
+    let prefix = if target.is_empty() {
+        format!("{tool}: ")
+    } else {
+        format!("{tool} {target}: ")
+    };
+    message.strip_prefix(&prefix).unwrap_or(message).to_string()
 }
 
 fn ask_schema() -> Value {
@@ -645,7 +646,7 @@ fn schema_object(name: &str, description: &str, properties: Value, required: &[&
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_schemas, schemas, stable_path_key};
+    use super::{failure_summary, filter_schemas, schemas, stable_path_key};
     use crate::core::cli::ToolMode;
 
     fn names(mode: ToolMode) -> Vec<String> {
@@ -661,6 +662,16 @@ mod tests {
         assert_eq!(names(ToolMode::ReadOnly), vec!["read", "grep", "ask"]);
         assert!(names(ToolMode::None).is_empty());
         assert_eq!(names(ToolMode::All).len(), schemas().len());
+    }
+
+    #[test]
+    fn failure_summary_uses_the_known_target_boundary() {
+        let target = "dir: name/file.rs";
+        let message = "edit dir: name/file.rs: old_string not found: retry with more context";
+        assert_eq!(
+            failure_summary(message, "edit", target),
+            "old_string not found: retry with more context"
+        );
     }
 
     #[test]

@@ -355,6 +355,12 @@ impl Default for AgentOptions {
     }
 }
 
+#[derive(Default)]
+struct PendingQueue {
+    items: Vec<String>,
+    paused: bool,
+}
+
 pub struct Agent {
     pub model: Model,
     /// The extension host; None means built-in tools only.
@@ -362,12 +368,9 @@ pub struct Agent {
     cwd: PathBuf,
     history: Arc<Mutex<Vec<ChatMessage>>>,
     events: mpsc::Sender<SessionEvent>,
-    /// Messages typed while a turn runs (steered or queued per settings).
-    pending: Arc<Mutex<Vec<String>>>,
-    /// While true the turn loop leaves `pending` untouched — the queued-
-    /// prompt review is editing it; the turn holds open at its end until
-    /// the review closes.
-    queue_paused: Arc<AtomicBool>,
+    /// Messages typed while a turn runs, plus the review pause guarded by
+    /// the same lock so pausing and taking the editable snapshot are atomic.
+    pending: Arc<Mutex<PendingQueue>>,
     cancel: Arc<AtomicBool>,
     running: bool,
     /// The session log; every committed message is appended.
@@ -407,8 +410,7 @@ impl Agent {
             cwd: std::env::current_dir().unwrap_or_default(),
             history: Arc::new(Mutex::new(Vec::new())),
             events,
-            pending: Arc::new(Mutex::new(Vec::new())),
-            queue_paused: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(Mutex::new(PendingQueue::default())),
             cancel: Arc::new(AtomicBool::new(false)),
             running: false,
             session: Arc::new(Mutex::new(None)),
@@ -600,28 +602,33 @@ impl Agent {
 
     /// Prompts waiting on the running turn (steering not yet drained).
     pub fn queued_count(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
-    /// The queued prompts, oldest first — the review edits a copy and
-    /// writes it back through [`Agent::set_queued`].
-    pub fn queued(&self) -> Vec<String> {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone()
+            .items
+            .len()
+    }
+
+    /// Pause queue draining and return the queued prompts, oldest first.
+    /// The worker tests the pause while holding this same lock, so it cannot
+    /// drain between the pause and snapshot used by the review.
+    pub fn pause_queue(&self) -> Vec<String> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.paused = true;
+        pending.items.clone()
     }
 
     /// Replace the queue wholesale (the review committing its edits).
     pub fn set_queued(&self, items: Vec<String>) {
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = items;
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).items = items;
     }
 
-    /// Pause or resume queue draining. Paused, the turn loop neither
-    /// steers pending prompts into the turn nor ends while any remain —
-    /// it holds open until the review releases them.
-    pub fn pause_queue(&self, paused: bool) {
-        self.queue_paused.store(paused, Ordering::SeqCst);
+    /// Resume queue draining after a review closes.
+    pub fn resume_queue(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .paused = false;
     }
 
     /// Resolve a waiting ask-tool call: `Some(text)` is the user's answer,
@@ -673,6 +680,7 @@ impl Agent {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .items
                 .push(message.content);
             return true;
         }
@@ -693,7 +701,6 @@ impl Agent {
         let cwd = self.cwd.clone();
         let effort = self.effort();
         let pending = self.pending.clone();
-        let queue_paused = self.queue_paused.clone();
         let host = self.host.clone();
         let tool_seq = self.tool_seq.clone();
         let wake = self.wake.clone();
@@ -744,15 +751,15 @@ impl Agent {
                     break false;
                 }
                 // Steer: fold any pending messages into this turn between
-                // steps — unless the queued-prompt review holds them.
-                let steered: Vec<String> = if queue_paused.load(Ordering::SeqCst) {
-                    Vec::new()
-                } else {
-                    pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .drain(..)
-                        .collect()
+                // steps unless the queued-prompt review holds them. The pause
+                // check and drain share one lock with the review snapshot.
+                let steered: Vec<String> = {
+                    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    if pending.paused {
+                        Vec::new()
+                    } else {
+                        std::mem::take(&mut pending.items)
+                    }
                 };
                 for message in steered {
                     let _ = events.send(SessionEvent::Steered(message.clone())).await;
@@ -1175,7 +1182,11 @@ impl Agent {
                     && calls.is_empty()
                     && reasoning_items.is_empty()
                     && !reasoning_streamed
-                    && pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                    && pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .items
+                        .is_empty()
                 {
                     if !empty_retried {
                         empty_retried = true;
@@ -1217,10 +1228,14 @@ impl Agent {
                     // queued-prompt review holds the queue, the turn holds
                     // open here instead of consuming or stranding it.
                     loop {
-                        if pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                        let (empty, paused) = {
+                            let pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                            (pending.items.is_empty(), pending.paused)
+                        };
+                        if empty {
                             break 'turn false;
                         }
-                        if !queue_paused.load(Ordering::SeqCst) {
+                        if !paused {
                             continue 'turn;
                         }
                         if !sleep_cancellable(Duration::from_millis(100), &cancel).await {
@@ -1354,12 +1369,16 @@ impl Agent {
                     // Worded so it stays true even if the compaction the
                     // frontend runs at TurnEnd fails — it must not claim a
                     // compaction that may not have happened.
-                    pending.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                        0,
-                        "The turn was paused because the context ran low. Continue the task \
-                         from where it left off."
-                            .into(),
-                    );
+                    pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .items
+                        .insert(
+                            0,
+                            "The turn was paused because the context ran low. Continue the task \
+                             from where it left off."
+                                .into(),
+                        );
                     break 'turn false;
                 }
             };
@@ -1378,11 +1397,9 @@ impl Agent {
     /// worker left to drain them. The frontend must resubmit them in order.
     pub fn on_turn_end(&mut self) -> Vec<String> {
         self.running = false;
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect()
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.paused = false;
+        std::mem::take(&mut pending.items)
     }
 
     pub fn interrupt(&mut self) {
@@ -1493,9 +1510,6 @@ async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools
         events,
         asks,
     } = context;
-    if name == "ask" && tool_mode.allows(name) {
-        return run_ask(id, arguments, &events, &asks, &cancel).await;
-    }
     if !tool_mode.allows(name) {
         let mode = match tool_mode {
             ToolMode::ReadOnly => "read-only",
@@ -1585,6 +1599,9 @@ async fn run_tool(context: ToolRunContext, name: &str, arguments: &str) -> tools
                 display: None,
             };
         }
+    }
+    if name == "ask" {
+        return run_ask(id, arguments, &events, &asks, &cancel).await;
     }
     let name = name.to_string();
     let arguments = arguments.to_string();

@@ -28,18 +28,53 @@ enum Op {
     Add(usize),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Lf,
+    CrLf,
+    None,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiffLine<'a> {
+    text: &'a str,
+    ending: Ending,
+}
+
+fn split_lines(text: &str) -> Vec<DiffLine<'_>> {
+    text.split_inclusive('\n')
+        .map(|line| {
+            if let Some(text) = line.strip_suffix("\r\n") {
+                DiffLine {
+                    text,
+                    ending: Ending::CrLf,
+                }
+            } else if let Some(text) = line.strip_suffix('\n') {
+                DiffLine {
+                    text,
+                    ending: Ending::Lf,
+                }
+            } else {
+                DiffLine {
+                    text: line,
+                    ending: Ending::None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn shown_line(line: DiffLine<'_>) -> String {
+    match line.ending {
+        Ending::CrLf => format!("{}␍", line.text),
+        _ => line.text.to_string(),
+    }
+}
+
 /// Render the diff between two texts. Empty when nothing changed.
 pub fn render(before: &str, after: &str) -> String {
-    let old: Vec<&str> = if before.is_empty() {
-        Vec::new()
-    } else {
-        before.lines().collect()
-    };
-    let new: Vec<&str> = if after.is_empty() {
-        Vec::new()
-    } else {
-        after.lines().collect()
-    };
+    let old = split_lines(before);
+    let new = split_lines(after);
     let ops = script(&old, &new);
     if !ops.iter().any(|op| !matches!(op, Op::Keep(..))) {
         return String::new();
@@ -68,20 +103,33 @@ pub fn render(before: &str, after: &str) -> String {
             continue;
         }
         elided = false;
-        let row = match op {
-            Op::Keep(n) => format!("{:>5}   {}", n, new[*n - 1]),
-            Op::Del(o) => format!("{:>5} - {}", o, old[*o - 1]),
-            Op::Add(n) => format!("{:>5} + {}", n, new[*n - 1]),
+        let (row, ending) = match op {
+            Op::Keep(n) => (
+                format!("{:>5}   {}", n, shown_line(new[*n - 1])),
+                new[*n - 1].ending,
+            ),
+            Op::Del(o) => (
+                format!("{:>5} - {}", o, shown_line(old[*o - 1])),
+                old[*o - 1].ending,
+            ),
+            Op::Add(n) => (
+                format!("{:>5} + {}", n, shown_line(new[*n - 1])),
+                new[*n - 1].ending,
+            ),
         };
-        out.push_str(row.trim_end());
+        out.push_str(&row);
         out.push('\n');
+        if !matches!(op, Op::Keep(_)) && ending == Ending::None {
+            out.push_str("      \\ No newline at end of file\n");
+        }
     }
-    out.trim_end().to_string()
+    out.pop();
+    out
 }
 
 /// The edit script: trim the exact common prefix and suffix, then LCS over
 /// the middle (or one replacement block when the middle is too large).
-fn script(old: &[&str], new: &[&str]) -> Vec<Op> {
+fn script(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<Op> {
     let mut prefix = 0;
     while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
         prefix += 1;
@@ -118,7 +166,7 @@ fn script(old: &[&str], new: &[&str]) -> Vec<Op> {
 
 /// Standard LCS table walk over the trimmed middle; deletions before
 /// insertions inside a replaced run, the conventional order.
-fn lcs_ops(old: &[&str], new: &[&str], offset: usize, ops: &mut Vec<Op>) {
+fn lcs_ops(old: &[DiffLine<'_>], new: &[DiffLine<'_>], offset: usize, ops: &mut Vec<Op>) {
     let (rows, cols) = (old.len(), new.len());
     let mut table = vec![0u32; (rows + 1) * (cols + 1)];
     for o in (0..rows).rev() {
@@ -176,6 +224,30 @@ mod tests {
     #[test]
     fn identical_texts_render_nothing() {
         assert_eq!(render("same\n", "same\n"), "");
+    }
+
+    #[test]
+    fn crlf_to_lf_is_visible() {
+        let out = render("one\r\ntwo\r\n", "one\ntwo\n");
+        assert!(out.contains("    1 - one␍"), "{out}");
+        assert!(out.contains("    1 + one"), "{out}");
+        assert!(!out.contains("    1 + one␍"), "{out}");
+    }
+
+    #[test]
+    fn final_newline_changes_are_visible() {
+        let removed = render("one\n", "one");
+        assert!(removed.contains("    1 - one"), "{removed}");
+        assert!(removed.contains("    1 + one"), "{removed}");
+        assert!(
+            removed.contains("\\ No newline at end of file"),
+            "{removed}"
+        );
+
+        let added = render("one", "one\n");
+        assert!(added.contains("    1 - one"), "{added}");
+        assert!(added.contains("    1 + one"), "{added}");
+        assert!(added.contains("\\ No newline at end of file"), "{added}");
     }
 
     #[test]

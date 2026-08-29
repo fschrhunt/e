@@ -236,6 +236,7 @@ impl Editor {
     /// it runs past a thousand codepoints, line count regardless; the token
     /// expands back on submit. Anything smaller inserts literally.
     pub fn insert_paste(&mut self, text: &str) {
+        self.delete_selection();
         let lines = text.lines().count().max(1);
         if text.chars().count() <= 1000 {
             self.insert_str(text);

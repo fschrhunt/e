@@ -69,6 +69,9 @@ pub struct Menu {
     pub selected: usize,
     window_start: usize,
     query: String,
+    /// True when a command opened this picker without trigger text in the
+    /// composer, so subsequent composer input is the filter itself.
+    pub(crate) filter_without_trigger: bool,
     /// Tab labels, cycled with the Tab key; empty for tab-less pickers.
     tabs: Vec<String>,
     active_tab: usize,
@@ -150,6 +153,7 @@ impl Menu {
             selected: 0,
             window_start: 0,
             query: String::new(),
+            filter_without_trigger: false,
             tabs: Vec::new(),
             active_tab: 0,
             all_tab: None,
@@ -157,6 +161,12 @@ impl Menu {
         };
         menu.refilter();
         menu
+    }
+
+    /// Keep filtering from composer text when no `/` trigger remains.
+    pub fn without_trigger(mut self) -> Self {
+        self.filter_without_trigger = true;
+        self
     }
 
     /// Give the picker a Tab-cycled filter dimension: labels, which one

@@ -366,10 +366,10 @@ async fn paused_queue_holds_the_turn_open_for_review_edits() {
     let _home = mock_home();
 
     let (mut agent, mut rx) = Agent::new(test_model("mock", port, Api::Completions));
-    agent.pause_queue(true);
+    assert!(agent.pause_queue().is_empty());
     agent.submit("hi".into(), "sys".into());
     agent.submit("second".into(), "sys".into());
-    assert_eq!(agent.queued_count(), 1);
+    assert_eq!(agent.pause_queue(), vec!["second".to_string()]);
 
     // While the review holds the queue the turn must not end and the
     // queued prompt must not steer.
@@ -394,7 +394,7 @@ async fn paused_queue_holds_the_turn_open_for_review_edits() {
     // The review commits an edit and releases: the edited prompt steers,
     // the original never does, and the turn ends.
     agent.set_queued(vec!["edited".into()]);
-    agent.pause_queue(false);
+    agent.resume_queue();
     let mut steered = Vec::new();
     let mut ended = false;
     while let Some(event) = rx.recv().await {
