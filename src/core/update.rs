@@ -57,7 +57,7 @@ pub fn is_release_version(v: &str) -> bool {
     segs.next().is_none()
         && three
             .iter()
-            .all(|s| s.is_some_and(|s| !s.is_empty() && s.parse::<u64>().is_ok()))
+            .all(|s| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
 }
 
 pub fn is_newer(candidate: &str, current: &str) -> bool {
