@@ -1,14 +1,20 @@
 //! The main-screen line renderer.
 //!
-//! The frame is a flat list of styled lines. The visible window is the last
-//! `rows` lines of the frame (a short frame sits at the top of the screen,
-//! as the reference launch does). Each paint diffs the window row-by-row
-//! against a shadow of what every screen row currently shows, and rewrites
-//! only the rows that changed, at absolute positions. When the frame
-//! overflows further down the screen, the display scrolls up first so the
-//! transcript keeps flowing into the terminal's scrollback, and only the
-//! blank rows at the bottom get painted. Paints are wrapped in synchronized
-//! output (?2026) to kill flicker where supported.
+//! The frame is a flat list of styled lines. The visible window is `rows`
+//! lines starting at a tracked origin (`window_origin`): normally the tail
+//! (`len - rows`), so the window follows the newest content as the frame
+//! grows and the older top flows into the terminal's scrollback. A short
+//! frame sits at the top of the screen, as the reference launch does. Each
+//! paint diffs the window row-by-row against a shadow of what every screen
+//! row currently shows, and rewrites only the rows that changed, at absolute
+//! positions. When the origin advances, the display scrolls up first so the
+//! top rows enter scrollback and only the blank rows at the bottom get
+//! painted. The origin is *held* when a frame shrinks with its committed top
+//! still on screen — the freed rows vacate at the bottom rather than the
+//! whole transcript rewinding upward (which a collapsing live region — a
+//! finished tool overlay, a folding thinking burst — otherwise caused).
+//! Paints are wrapped in synchronized output (?2026) to kill flicker where
+//! supported.
 //!
 //! Launch starts from a clean slate: whatever the terminal showed before e
 //! started is scrolled into the scrollback with newlines (so it stays
@@ -35,6 +41,12 @@ pub struct Screen {
     /// when the shadow never painted them — the terminal reflowed stale
     /// content into them.
     clear_unpainted: bool,
+    /// The frame line currently shown at screen row 0 — the window's top.
+    /// Monotonic while the frame grows (the display scrolls up into
+    /// scrollback); a frame that *shrinks* holds this fixed so the committed
+    /// top stays put and only the bottom rows vacate, instead of the whole
+    /// transcript rewinding upward. See `window_origin`.
+    origin: usize,
     /// Set by `clear_slate` so the launch scroll cannot run twice.
     cleared: bool,
     pub cols: u16,
@@ -51,20 +63,21 @@ pub(crate) struct RowAction<'a> {
 }
 
 /// Which screen rows need a rewrite for `lines` to be visible, given the
-/// `shadow` of what each row currently shows. The window is the frame's
-/// last `height` lines; rows outside it are cleared when they may hold
-/// stale content (`clear_unpainted`), and left alone when they are already
-/// blank or were never painted (launch's `clear_slate` leaves no unknown
-/// rows, so this is pure conservatism for the differ's callers).
+/// `shadow` of what each row currently shows. The window starts at frame
+/// line `n0` (see `window_origin`) and spans `height` rows; rows past the
+/// frame's end are cleared when they may hold stale content
+/// (`clear_unpainted`), and left alone when they are already blank or were
+/// never painted (launch's `clear_slate` leaves no unknown rows, so this is
+/// pure conservatism for the differ's callers).
 pub(crate) fn plan<'a>(
     lines: &'a [String],
+    n0: usize,
     height: usize,
     shadow: &[Option<String>],
     clear_unpainted: bool,
 ) -> Vec<RowAction<'a>> {
     let len = lines.len();
-    let n0 = len.saturating_sub(height);
-    let in_window = len.saturating_sub(n0); // min(len, height)
+    let in_window = len.saturating_sub(n0).min(height);
     let mut actions = Vec::new();
     for row in 0..height {
         let action = if row < in_window {
@@ -96,18 +109,30 @@ pub(crate) fn plan<'a>(
     actions
 }
 
-/// How many rows the display must scroll up so the frame's visible window
-/// (its last `height` lines) sits at screen rows 0..height. Zero when the
-/// window did not move downward — shrinking frames repaint in place rather
-/// than pulling from scrollback.
-pub(crate) fn scroll_rows(prev_len: usize, len: usize, height: usize) -> usize {
-    let prev_overflow = prev_len.saturating_sub(height);
-    let overflow = len.saturating_sub(height);
-    // The screen can only give up `height` scroll rows per frame — shadow
-    // holds exactly one slot per row, and a reflow (resize, tab switch) can
-    // make a frame jump by hundreds of rows at once. Uncapped, drain(0..scroll)
-    // panicked past the shadow (#the blank-screen freeze).
-    overflow.saturating_sub(prev_overflow).min(height)
+/// The frame line to show at screen row 0 for the next paint, given where
+/// the last paint's window began (`prev_origin`). The default is the
+/// tail-anchor `len - height`: the window tracks the newest content as the
+/// frame grows, scrolling the older top into scrollback.
+///
+/// The exception is a frame that *shrinks* while its committed top is still
+/// on screen (`prev_origin < len`): the origin holds, so the top stays fixed
+/// and the freed rows vacate at the bottom (composer, status). Without this
+/// the origin fell to the new, smaller `len - height` and the whole
+/// transcript rewound upward every time a live region collapsed — a live
+/// tool overlay vanishing, the activity label dropping, a short thinking
+/// burst folding to `Thought for Ns` — which read as a violent screen jump.
+///
+/// A collapse that drops content *below* the committed top
+/// (`prev_origin >= len`) re-anchors to the tail: those rows already scrolled
+/// into the terminal's own scrollback, which no paint can pull back, so
+/// showing the newest tail beats leaving the window stranded past the frame.
+pub(crate) fn window_origin(prev_origin: usize, len: usize, height: usize) -> usize {
+    let tail = len.saturating_sub(height);
+    if prev_origin <= tail || prev_origin >= len {
+        tail
+    } else {
+        prev_origin
+    }
 }
 
 impl Screen {
@@ -116,6 +141,7 @@ impl Screen {
             prev: Vec::new(),
             shadow: vec![None; rows as usize],
             clear_unpainted: false,
+            origin: 0,
             cleared: false,
             cols,
             rows,
@@ -153,6 +179,8 @@ impl Screen {
         self.prev.clear();
         self.shadow = vec![None; rows as usize];
         self.clear_unpainted = true;
+        // The reflow discards the old window; the next frame re-anchors.
+        self.origin = 0;
     }
 
     pub fn paint(&mut self, lines: &[String]) -> io::Result<()> {
@@ -174,7 +202,15 @@ impl Screen {
         }
         let cols = self.cols as usize;
         let rows = self.rows as usize;
-        let scroll = scroll_rows(self.prev.len(), lines.len(), rows);
+        let origin = window_origin(self.origin, lines.len(), rows);
+        // The display can only give up `rows` scroll rows per frame — shadow
+        // holds one slot per row, and a reflow can make the origin jump by
+        // hundreds at once. Uncapped, drain(0..scroll) ran past the shadow
+        // (#the blank-screen freeze). A jump past a full screen clears every
+        // shadow slot below, so the capped paint still repaints the whole
+        // window correctly.
+        let scroll = origin.saturating_sub(self.origin).min(rows);
+        self.origin = origin;
 
         // A line that fills the row leaves the cursor in the pending-wrap
         // state, where erase-to-end clears the cell under it — eating the
@@ -207,7 +243,7 @@ impl Screen {
             self.shadow.extend((0..scroll).map(|_| None));
         }
 
-        let actions = plan(lines, rows, &self.shadow, self.clear_unpainted);
+        let actions = plan(lines, origin, rows, &self.shadow, self.clear_unpainted);
         // Runs of adjacent dirty rows: position once, then `\r\n` between
         // rows. The `\r` before the absolute position is what keeps the
         // differ independent of the terminal's pending-wrap state.
@@ -255,7 +291,7 @@ mod tests {
     #[test]
     fn short_frame_paints_the_blank_screen_rows() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let actions = plan(&lines, 3, &shadow(&[None, None, None]), false);
+        let actions = plan(&lines, 0, 3, &shadow(&[None, None, None]), false);
         assert_eq!(actions.len(), 2);
         assert_eq!(actions[0].row, 0);
         assert_eq!(actions[0].write, Some("a"));
@@ -266,7 +302,7 @@ mod tests {
     #[test]
     fn unchanged_rows_are_skipped_but_dirty_rows_rewrite() {
         let lines = vec!["a".to_string(), "b".to_string()];
-        let actions = plan(&lines, 3, &shadow(&[Some("a"), None, None]), false);
+        let actions = plan(&lines, 0, 3, &shadow(&[Some("a"), None, None]), false);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].row, 1);
     }
@@ -274,7 +310,7 @@ mod tests {
     #[test]
     fn tall_frame_maps_its_tail_onto_the_screen() {
         let lines: Vec<String> = (0..5).map(|i| format!("row{i}")).collect();
-        let actions = plan(&lines, 3, &shadow(&[None, None, None]), false);
+        let actions = plan(&lines, 2, 3, &shadow(&[None, None, None]), false);
         assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].write, Some("row2"));
         assert_eq!(actions[2].write, Some("row4"));
@@ -284,17 +320,23 @@ mod tests {
     fn rows_below_a_short_frame_clear_only_when_painted() {
         let lines = vec!["a".to_string()];
         // Painted content below the last row: cleared.
-        let actions = plan(&lines, 3, &shadow(&[Some("a"), Some("stale"), None]), false);
+        let actions = plan(
+            &lines,
+            0,
+            3,
+            &shadow(&[Some("a"), Some("stale"), None]),
+            false,
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].row, 1);
         assert_eq!(actions[0].write, None);
         // Already blank: left alone.
-        assert!(plan(&lines, 3, &shadow(&[Some("a"), Some(""), None]), false).is_empty());
+        assert!(plan(&lines, 0, 3, &shadow(&[Some("a"), Some(""), None]), false).is_empty());
         // Never painted and not forced: left alone (plan stays conservative;
         // in practice `clear_slate` marks every row known-blank at launch).
-        assert!(plan(&lines, 3, &shadow(&[Some("a"), None, None]), false).is_empty());
+        assert!(plan(&lines, 0, 3, &shadow(&[Some("a"), None, None]), false).is_empty());
         // Never painted but forced (after a resize): cleared.
-        let actions = plan(&lines, 3, &shadow(&[Some("a"), None, None]), true);
+        let actions = plan(&lines, 0, 3, &shadow(&[Some("a"), None, None]), true);
         assert_eq!(actions.len(), 2);
         assert!(actions.iter().all(|a| a.write.is_none()));
     }
@@ -306,28 +348,42 @@ mod tests {
         let lines = vec!["a".to_string()];
         // Every frame row writes (nothing is unknown), and no other row
         // needs touching — the slate is known-blank.
-        let actions = plan(&lines, 3, &screen.shadow, false);
+        let actions = plan(&lines, 0, 3, &screen.shadow, false);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].row, 0);
         assert_eq!(actions[0].write, Some("a"));
     }
 
     #[test]
-    fn scroll_rows_tracks_window_movement_only() {
-        // Both short: no scroll.
-        assert_eq!(scroll_rows(2, 3, 10), 0);
-        // Tall growth overflows one further row.
-        assert_eq!(scroll_rows(20, 23, 10), 3);
-        // Short→tall scrolls the overflow.
-        assert_eq!(scroll_rows(2, 13, 10), 3);
-        // Shrinking never scrolls — the window repaints in place.
-        assert_eq!(scroll_rows(13, 10, 10), 0);
-        assert_eq!(scroll_rows(23, 20, 10), 0);
-        // A reflow can make one frame jump by more rows than the screen
-        // has; the scroll never exceeds the height (shadow holds exactly
-        // one slot per row).
-        assert_eq!(scroll_rows(0, 739, 53), 53);
-        assert_eq!(scroll_rows(0, 686, 10), 10);
+    fn window_origin_anchors_the_tail_but_holds_on_shrink() {
+        // First paint / short frame: tail anchor is 0.
+        assert_eq!(window_origin(0, 3, 10), 0);
+        // Growth past the screen tracks the newest content (len - height).
+        assert_eq!(window_origin(0, 13, 10), 3);
+        assert_eq!(window_origin(10, 23, 10), 13);
+        // The regression: a frame shrinking while its committed top is still
+        // on screen HOLDS the origin — the top stays put, the bottom vacates,
+        // instead of rewinding to the smaller `len - height`.
+        assert_eq!(window_origin(13, 18, 10), 13); // was 8 (rewind) before
+        assert_eq!(window_origin(13, 14, 10), 13); // one row left of content
+                                                   // A collapse dropping content below the committed top can't un-scroll
+                                                   // the terminal's scrollback: re-anchor to the newest tail.
+        assert_eq!(window_origin(30, 6, 10), 0);
+        assert_eq!(window_origin(30, 40, 10), 30); // regrowth past it, unchanged
+    }
+
+    /// The paint's scroll is the origin's forward movement, capped at the
+    /// screen height so `shadow.drain` never runs past its slots — a reflow
+    /// can move the origin by hundreds at once.
+    #[test]
+    fn scroll_is_capped_origin_advance() {
+        let scroll = |prev, len, h: usize| window_origin(prev, len, h).saturating_sub(prev).min(h);
+        assert_eq!(scroll(10, 23, 10), 3);
+        assert_eq!(scroll(0, 739, 53), 53);
+        // A shrink that holds the origin does not scroll.
+        assert_eq!(scroll(13, 14, 10), 0);
+        // A re-anchor downward does not scroll (the display can't move down).
+        assert_eq!(scroll(30, 6, 10), 0);
     }
 }
 

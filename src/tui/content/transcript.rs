@@ -408,13 +408,12 @@ impl Block {
                 if text.is_empty() {
                     return Vec::new();
                 }
-                // Live thinking wears the palette's thinkingText; a collapsed
-                // burst's summary row dims (`dim` on light is one step
-                // further toward the background than statusline).
-                let color = if self.done { "dim" } else { "thinkingText" };
-                // The collapsed summary keeps its `· ` marker; live thinking
-                // drops the dot, and the text starts where the dot was.
-                let (prefix, pad) = if self.done { ("  · ", 4) } else { ("  ", 2) };
+                // Thinking always renders as its full streamed text in the
+                // palette's thinkingText, no dot marker — there is no collapse
+                // to a `Thought for Ns` summary (that shrank the frame
+                // mid-turn and read as a screen jump). Shown only when
+                // `show_thinking` is on.
+                let (color, prefix, pad) = ("thinkingText", "  ", 2);
                 wrap_styled(text, width.saturating_sub(pad).max(8))
                     .into_iter()
                     .map(|l| theme.fg(color, &format!("{prefix}{l}")))
@@ -1042,42 +1041,32 @@ mod tests {
         assert!(block.overlay_rows(&theme, 80).is_empty());
     }
 
-    /// Thinking streams live in thinkingText; once its burst ends, the
-    /// collapsed block is a single dim summary row.
+    /// Thinking renders its full streamed text in thinkingText, one wrapped
+    /// row per line, with no `·` marker and no collapse to a summary — ending
+    /// a burst leaves the thought expanded where it sits.
     #[test]
-    fn thinking_streams_live_then_collapses_to_one_dim_row() {
-        // Distinct colors so the live/collapsed shift is observable.
+    fn thinking_renders_expanded_in_thinking_text_without_collapse() {
         let theme = Theme::from_json(
             r#"{"vars":{"a":250,"b":240},"colors":{"thinkingText":"a","dim":"b"}}"#,
         )
         .unwrap();
         let mut block = Block::new(Kind::Thinking, "let me look at this\nstep two");
-        let live = block.lines_for_test(&theme, 40);
-        assert!(live.len() >= 2, "thinking rows render");
-        for row in &live {
-            // Live thinking carries no `·` — the dot belongs to the
-            // collapsed summary; here the text starts where it would be.
-            assert!(!row.contains("·"), "live thinking rows drop the marker");
+        let rows = block.lines_for_test(&theme, 40);
+        assert!(rows.len() >= 2, "every thought line renders");
+        for row in &rows {
+            assert!(!row.contains("·"), "thinking carries no dot marker");
             assert!(
                 row.contains(theme.fg_prefix("thinkingText")),
-                "live thinking wears thinkingText"
+                "thinking wears thinkingText, never the dim summary color"
             );
         }
-        // Burst end: events.rs swaps in the summary text and marks the
-        // block done; only the paint contract is pinned here.
-        block.text = "Thought for 12s".into();
-        block.done = true;
+        // A finished burst is never rewritten to a one-line summary: growing
+        // the text keeps growing the rendered rows.
+        block.text = "let me look at this\nstep two\nand a third".into();
         block.touch();
-        let collapsed = block.lines_for_test(&theme, 40);
-        assert_eq!(collapsed.len(), 1, "a collapsed burst is one row");
-        assert!(collapsed[0].contains("Thought for 12s"));
         assert!(
-            collapsed[0].contains("· "),
-            "the collapsed summary keeps its dot marker"
-        );
-        assert!(
-            collapsed[0].contains(theme.fg_prefix("dim")),
-            "the collapsed row dims"
+            block.lines_for_test(&theme, 40).len() >= 3,
+            "the thought stays expanded, not collapsed to one row"
         );
     }
 

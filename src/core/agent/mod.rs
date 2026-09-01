@@ -442,8 +442,8 @@ impl Agent {
     }
     /// The model's declared effort levels, in order; empty when it has no
     /// reasoning knob.
-    pub fn efforts(&self) -> Vec<String> {
-        self.model.efforts.clone()
+    pub fn effort_levels(&self) -> Vec<String> {
+        self.model.effort.clone()
     }
     /// The effort for the next request: the saved setting when this model
     /// supports it, else the model's strong default (`high` when declared,
@@ -454,7 +454,7 @@ impl Agent {
             .effort_override
             .clone()
             .or_else(|| crate::core::config::settings::get_string("effort"));
-        effort(&self.model.efforts, saved.as_deref())
+        effort(&self.model.effort, saved.as_deref())
     }
     /// Advance to the model's next effort level and persist it. None when
     /// the model has no reasoning knob.
@@ -462,7 +462,7 @@ impl Agent {
         if self.options.effort_override.is_some() {
             return Ok(self.effort());
         }
-        let levels = self.efforts();
+        let levels = self.effort_levels();
         if levels.is_empty() {
             return Ok(None);
         }

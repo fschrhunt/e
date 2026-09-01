@@ -24,8 +24,7 @@ use crate::tui::menu::{
 };
 use crate::tui::screen::Painter;
 use crate::tui::statusline::{
-    format_elapsed, statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase,
-    RECOVERED_VISIBLE_MS,
+    statusline, RecoveredStatus, RetryStatus, StatusData, Turn, TurnPhase, RECOVERED_VISIBLE_MS,
 };
 use crate::tui::theme::Theme;
 use crate::tui::transcript::{Block, Kind, Transcript};
@@ -41,12 +40,11 @@ struct ActiveTurn {
     block: Option<usize>,
     text: String,
     /// The live thinking block for the current burst, if reasoning has
-    /// streamed. Earlier bursts from this turn collapsed where they ended —
-    /// this index is only the open segment.
+    /// streamed. Ending a burst detaches this so the next reasoning opens a
+    /// fresh block; the finished thought stays expanded in place — this index
+    /// is only the open segment.
     thinking_block: Option<usize>,
     thinking: String,
-    /// When the open burst started, for the collapsed row's duration.
-    thinking_started: Option<Instant>,
     turn: Turn,
     started: Instant,
     error: Option<String>,
@@ -1126,7 +1124,7 @@ impl App {
     fn open_settings(&mut self) {
         self.menu = None;
         self.settings = Some(crate::tui::settingspanel::SettingsPanel::new(
-            self.agent.efforts(),
+            self.agent.effort_levels(),
         ));
     }
 
@@ -3150,7 +3148,7 @@ mod tests {
             responses_mount: crate::core::providers::registry::ResponsesMount::Platform,
             provider_supports_tools: true,
             provider_image_input: false,
-            efforts: Vec::new(),
+            effort: Vec::new(),
             thinking: crate::core::providers::catalog::Thinking::Manual,
             context_window: 200_000,
             max_output: None,
@@ -3450,10 +3448,12 @@ mod tests {
     }
 
     /// A typical think-then-tools turn opens a second thinking burst below
-    /// the tools; each burst collapses to one row where it ends, and TurnEnd
-    /// collapses the final one.
+    /// the tools. Ending a burst — tools taking over, or TurnEnd — detaches it
+    /// but leaves the thought expanded where it sits: no collapse to a
+    /// `Thought for Ns` row, and never marked done (which would shrink the
+    /// frame and jump the screen).
     #[test]
-    fn thinking_bursts_collapse_at_each_handoff() {
+    fn thinking_bursts_stay_expanded_at_each_handoff() {
         let mut app = session_app();
         app.on_session_event(SessionEvent::TurnStart);
         app.on_session_event(SessionEvent::ReasoningDelta("before tools".into()));
@@ -3462,33 +3462,35 @@ mod tests {
         app.on_session_event(tool_batch());
         assert_eq!(
             thinking_flags(&app),
-            vec![("Thought for 0s".into(), true)],
-            "the pre-tool burst collapses when tools take over"
+            vec![("before tools".into(), false)],
+            "the pre-tool burst stays expanded when tools take over"
         );
 
         app.on_session_event(SessionEvent::ReasoningDelta("after tools".into()));
         assert_eq!(
             thinking_flags(&app),
             vec![
-                ("Thought for 0s".into(), true),
+                ("before tools".into(), false),
                 ("after tools".into(), false)
-            ]
+            ],
+            "a fresh burst opens its own block below the tools"
         );
 
         app.on_session_event(SessionEvent::TurnEnd { aborted: false });
         assert_eq!(
             thinking_flags(&app),
             vec![
-                ("Thought for 0s".into(), true),
-                ("Thought for 0s".into(), true)
-            ]
+                ("before tools".into(), false),
+                ("after tools".into(), false)
+            ],
+            "TurnEnd leaves both thoughts expanded, unchanged"
         );
     }
 
-    /// Retries and steered messages also end the live burst; each collapsed
-    /// row keeps its place in the transcript.
+    /// Retries and steered messages also end the live burst; each thought
+    /// keeps its expanded place, and the next burst opens a new block.
     #[test]
-    fn thinking_collapses_at_retry_and_steer() {
+    fn thinking_stays_expanded_at_retry_and_steer() {
         let mut app = session_app();
         app.on_session_event(SessionEvent::TurnStart);
         app.on_session_event(SessionEvent::ReasoningDelta("attempt one".into()));
@@ -3501,8 +3503,8 @@ mod tests {
         });
         assert_eq!(
             thinking_flags(&app),
-            vec![("Thought for 0s".into(), true)],
-            "the abandoned attempt's burst collapses at the retry"
+            vec![("attempt one".into(), false)],
+            "the abandoned attempt's thought stays put at the retry"
         );
 
         app.on_session_event(SessionEvent::ReasoningDelta("attempt two".into()));
@@ -3511,8 +3513,8 @@ mod tests {
         assert_eq!(
             thinking_flags(&app),
             vec![
-                ("Thought for 0s".into(), true),
-                ("Thought for 0s".into(), true),
+                ("attempt one".into(), false),
+                ("attempt two".into(), false),
                 ("after steer".into(), false)
             ]
         );
@@ -3521,9 +3523,9 @@ mod tests {
         assert_eq!(
             thinking_flags(&app),
             vec![
-                ("Thought for 0s".into(), true),
-                ("Thought for 0s".into(), true),
-                ("Thought for 0s".into(), true)
+                ("attempt one".into(), false),
+                ("attempt two".into(), false),
+                ("after steer".into(), false)
             ]
         );
     }

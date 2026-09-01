@@ -12,8 +12,37 @@ use crate::core::providers::{
     Request, SseStream, StreamEnd, ToolCall,
 };
 
-/// One chat-completions request; retried without `stream_options` when a
-/// strict gateway names that field in its validation error.
+/// Models that rejected our `reasoning_effort` at least once this run. Effort
+/// levels are declared data (a seed, a `models.json` override), and a
+/// realtime-discovered gateway can accept a set we never see advertised — so
+/// a declared level can be wrong for the actual backend. Rather than hard-fail
+/// on that, the request self-heals (retries without the field) and records the
+/// model here, so we stop paying a failed round-trip for it every step. Keyed
+/// `provider/id`; process-scoped, fail-open (a poisoned lock just re-probes).
+fn reasoning_rejected() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+fn reasoning_is_rejected(model: &crate::core::providers::catalog::Model) -> bool {
+    let key = format!("{}/{}", model.provider, model.id);
+    reasoning_rejected()
+        .lock()
+        .map(|set| set.contains(&key))
+        .unwrap_or(false)
+}
+
+fn mark_reasoning_rejected(model: &crate::core::providers::catalog::Model) {
+    let key = format!("{}/{}", model.provider, model.id);
+    if let Ok(mut set) = reasoning_rejected().lock() {
+        set.insert(key);
+    }
+}
+
+/// One chat-completions request. The caller retries it once without an
+/// optional field (`stream_options`, `reasoning_effort`) when a strict gateway
+/// names that field — or the reasoning knob — in its validation error.
 async fn send(
     request: &Request,
     authorization: &Authorization,
@@ -88,8 +117,11 @@ pub async fn run(
     // Reasoning effort rides the OpenAI-standard field; only sent when the
     // model declares a knob, so gateways that never heard of it never see
     // it. `off` has no wire encoding here — absence is the closest thing.
+    // Skipped for a model already known to reject it (see `reasoning_rejected`).
     if let Some(effort) = request.effort.as_deref().filter(|e| *e != "off") {
-        body["reasoning_effort"] = json!(effort);
+        if !reasoning_is_rejected(&request.model) {
+            body["reasoning_effort"] = json!(effort);
+        }
     }
     if !request.tools.is_empty() {
         body["tools"] = json!(request.tools);
@@ -100,20 +132,35 @@ pub async fn run(
         let status = first.status();
         let retry_after = retry_after_seconds(&first);
         let text = first.text().await.unwrap_or_default();
-        // Usage is useful but not essential. Strict OpenAI-compatible
-        // gateways commonly identify this optional field in their validation
-        // error; a rejected request generated no content, so one retry without
-        // it is safe and avoids a provider-specific compatibility table.
-        if text.to_ascii_lowercase().contains("stream_options") {
-            // The body was built from our own typed request, so it is an
-            // object; a non-object falls through to the plain error path
-            // rather than panicking.
-            if let Some(body_object) = body.as_object_mut() {
-                body_object.remove("stream_options");
-                require_success(send(request, authorization, &body).await?).await?
-            } else {
-                return Err(ProviderError::from_status(status, &text).with_retry_after(retry_after));
+        let lower = text.to_ascii_lowercase();
+        // A validation rejection over an optional field we added is recoverable:
+        // drop the offending field(s) and retry once, rather than carry a
+        // provider-specific compatibility table. A rejected request generated
+        // no content, so the retry is safe. The body is our own typed object;
+        // a non-object can't be repaired, so it falls through to the error.
+        let repaired = body.as_object_mut().map(|object| {
+            let mut changed = false;
+            // Usage is useful but not essential; strict OpenAI-compatible
+            // gateways commonly name it in the validation error.
+            if lower.contains("stream_options") && object.remove("stream_options").is_some() {
+                changed = true;
             }
+            // The declared effort level is wrong for this backend (an
+            // unadvertised set, a stale override). Drop the knob so the model
+            // runs at its own default instead of hard-failing, and remember so
+            // we stop re-sending it. The error names the field, or — as the Go
+            // gateway does for GLM — says the model's thinking can't be tuned.
+            if object.contains_key("reasoning_effort")
+                && (lower.contains("reasoning") || lower.contains("thinking"))
+            {
+                object.remove("reasoning_effort");
+                mark_reasoning_rejected(&request.model);
+                changed = true;
+            }
+            changed
+        });
+        if repaired == Some(true) {
+            require_success(send(request, authorization, &body).await?).await?
         } else {
             return Err(ProviderError::from_status(status, &text).with_retry_after(retry_after));
         }

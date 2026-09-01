@@ -711,6 +711,54 @@ async fn completions_retries_without_rejected_stream_options() {
     assert!(request_json(&sent[1]).get("stream_options").is_none());
 }
 
+/// A declared effort level can be wrong for the real backend (an unadvertised
+/// set, a stale override). The dialect self-heals: on a reasoning-shaped 400
+/// it retries once without `reasoning_effort`, then remembers the model so
+/// later requests skip the field up front instead of eating a failed
+/// round-trip each step.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn completions_self_heals_and_remembers_rejected_reasoning_effort() {
+    let _lock = env_lock();
+    let rejected =
+        r#"{"error":{"message":"Unsupported value: 'reasoning_effort' does not accept 'high'"}}"#;
+    let four_hundred = format!(
+        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{rejected}",
+        rejected.len()
+    );
+    let ok = common::sse_response("data: [DONE]\n\n");
+    // conn 0: first attempt (rejected) · conn 1: retry without the field ·
+    // conn 2: a fresh request that must never carry the field again.
+    let (port, server) = common::serve_raw(vec![four_hundred, ok.clone(), ok]);
+    let home = Home::new("reasoning-heal");
+    home.auth(r#"{"reasoning-heal":{"key":"k"}}"#);
+    let model = test_model("reasoning-heal", port, Api::Completions);
+    let make = || Request {
+        model: model.clone(),
+        system: "sys".into(),
+        messages: vec![ChatMessage::user("hello")],
+        effort: Some("high".into()),
+        tools: Vec::new(),
+    };
+
+    collect_stream(make()).await; // attempt + heal
+    collect_stream(make()).await; // remembered: no reasoning_effort at all
+    let sent = server.join().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert!(
+        request_json(&sent[0]).get("reasoning_effort").is_some(),
+        "the first attempt sends the declared level"
+    );
+    assert!(
+        request_json(&sent[1]).get("reasoning_effort").is_none(),
+        "the retry drops the rejected field"
+    );
+    assert!(
+        request_json(&sent[2]).get("reasoning_effort").is_none(),
+        "the model is remembered — later requests never re-send it"
+    );
+}
+
 // The plain-key mount must never see `prompt_cache_key` (pinned in
 // `assert_wire` above); the codex OAuth mount must always send it — pin
 // both ends so a refactor can't silently drop it from the OAuth branch.
@@ -1287,7 +1335,7 @@ fn registry_and_catalog_match_the_embedded_data() {
             assert_eq!(model.api, provider.api(), "{}", decl.id);
             assert_eq!(model.context_window, decl.context_window, "{}", decl.id);
             assert_eq!(model.max_output, decl.max_output, "{}", decl.id);
-            assert_eq!(model.efforts, decl.efforts, "{}", decl.id);
+            assert_eq!(model.effort, decl.effort, "{}", decl.id);
             let thinking = match decl.thinking.as_deref() {
                 Some("adaptive") => Thinking::Adaptive,
                 _ => Thinking::Manual,
@@ -1368,6 +1416,26 @@ fn registry_and_catalog_match_the_embedded_data() {
         haiku.max_output,
         Some(8_192),
         "haiku's real output ceiling is well under the Anthropic dialect's 32k default"
+    );
+
+    // opencode-go's GLM reasoning levels are probe-verified against the Go
+    // gateway (which advertises none of them) and are NOT uniform across the
+    // family: glm-5.3-flash rejects `medium`. Pinned so a future edit can't
+    // silently drop them back to "no knob" or guess a wrong standard set.
+    let go_effort = |id: &str| {
+        catalog
+            .iter()
+            .find(|m| m.provider == "opencode-go" && m.id == id)
+            .unwrap_or_else(|| panic!("{id} missing from the opencode-go catalog"))
+            .effort
+            .clone()
+    };
+    assert_eq!(go_effort("glm-5.2"), ["low", "medium", "high", "max"]);
+    assert_eq!(go_effort("glm-5.3"), ["low", "medium", "high", "max"]);
+    assert_eq!(
+        go_effort("glm-5.3-flash"),
+        ["low", "high", "max"],
+        "flash takes no `medium` — the gateway 400s it"
     );
 }
 
@@ -1489,7 +1557,7 @@ fn models_json_windows_and_overrides() {
 #[test]
 fn partial_override_inherits_the_builtin() {
     let _lock = env_lock();
-    // One field corrected; transport, window, efforts, and thinking stay
+    // One field corrected; transport, window, effort, and thinking stay
     // with the built-in. Three former tests, one reproduction.
     let catalog = catalog_with_models_json(
         r#"{"providers":{"anthropic":{"models":[
@@ -1512,7 +1580,7 @@ fn partial_override_inherits_the_builtin() {
         .unwrap();
     assert_eq!(sonnet.context_window, 1_000_000);
     assert_eq!(
-        sonnet.efforts,
+        sonnet.effort,
         vec!["low".to_string(), "medium".to_string(), "high".to_string()]
     );
     assert_eq!(sonnet.thinking, Thinking::Adaptive);
