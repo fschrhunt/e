@@ -7,7 +7,7 @@ responsibly disclose your findings and will make every effort to acknowledge
 your contributions.
 
 To report a security issue, please email
-[support@intuitum.sh](mailto:support@intuitum.sh) and include the word
+[security@intuitum.sh](mailto:security@intuitum.sh) and include the word
 "SECURITY" in the subject line. Do not open a public issue for anything
 security-sensitive.
 
