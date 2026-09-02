@@ -56,9 +56,8 @@ built-in's provider and id replaces it — the file wins, like themes.
 - `effort` on a model object declares its reasoning levels, in cycle order —
   shift+tab walks exactly this list (e.g. `["low", "medium", "high",
   "xhigh"]`). A model entry without `effort` inherits its provider default,
-  then its built-in declaration; otherwise it has no reasoning knob. The old
-  `efforts` spelling remains accepted for existing files. Levels are the exact
-  strings sent as `reasoning_effort` (or the dialect's equivalent), so they
+  then its built-in declaration; otherwise it has no reasoning knob. Levels
+  are the exact strings sent as `reasoning_effort` (or the dialect's equivalent), so they
   must match what the backend accepts —
   e.g. opencode-go's `glm-5.3-flash` takes `["low", "high", "max"]` (no
   `medium`), a set the gateway does not advertise and e cannot infer, so it is

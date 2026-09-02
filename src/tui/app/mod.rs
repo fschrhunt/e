@@ -581,6 +581,11 @@ impl App {
         // placeholder, not something the user chose, so don't show it.
         let data = StatusData {
             model: self.signed_in.then(|| self.agent.model_slug()),
+            effort: if self.signed_in {
+                self.status_effort.clone()
+            } else {
+                None
+            },
             context_used: self.context_tokens,
             context_total: Some(window),
         };
@@ -2610,16 +2615,12 @@ pub async fn run(
                                 && !ctrl
                                 && k.modifiers.contains(KeyModifiers::SHIFT))
                         {
-                            // Shift+tab cycles the reasoning effort through
-                            // whatever levels this model declares. The
-                            // statusline already shows the new level; only a
-                            // model without a reasoning knob gets a notice.
+                            // Shift+tab cycles the model's declared levels.
+                            // Normal operation stays out of the transcript;
+                            // the persistent statusline is the confirmation.
                             match app.agent.cycle_effort() {
-                                Ok(Some(effort)) => {
-                                    app.refresh_status_cache();
-                                    app.notice(format!("reasoning effort set to {effort}"));
-                                }
-                                Ok(None) => app.notice("this model has no reasoning effort control".into()),
+                                Ok(Some(_)) => app.refresh_status_cache(),
+                                Ok(None) => {}
                                 Err(error) => app.notice(format!("could not save reasoning effort: {error}")),
                             }
                         } else if !ctrl && app.queue_review_key(k.code) {

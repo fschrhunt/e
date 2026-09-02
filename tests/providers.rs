@@ -1564,25 +1564,6 @@ fn models_json_windows_and_overrides() {
 }
 
 #[test]
-fn legacy_efforts_key_remains_accepted() {
-    let _lock = env_lock();
-    let catalog = catalog_with_models_json(
-        r#"{"providers":{"custom":{"base_url":"https://example.invalid","efforts":["low","high"],"models":["one",{"id":"two","efforts":["max"]}]}}}"#,
-    );
-    let effort = |id: &str| {
-        catalog
-            .iter()
-            .find(|model| model.provider == "custom" && model.id == id)
-            .unwrap()
-            .effort
-            .clone()
-    };
-    assert_eq!(effort("one"), ["low", "high"]);
-    // A per-model declaration still wins when both use the legacy spelling.
-    assert_eq!(effort("two"), ["max"]);
-}
-
-#[test]
 fn partial_override_inherits_the_builtin() {
     let _lock = env_lock();
     // One field corrected; transport, window, effort, and thinking stay
