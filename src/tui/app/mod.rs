@@ -1218,6 +1218,28 @@ impl App {
         }
         self.editor.push_history(text);
 
+        if let Some((path, prompt)) = leading_image_prompt(&trimmed) {
+            if !self.agent.model.image_input {
+                self.notice(format!(
+                    "{} does not accept image input",
+                    model::slug(&self.agent.model)
+                ));
+                return;
+            }
+            match crate::core::providers::ImageInput::from_path(std::path::Path::new(path)) {
+                Ok(image) => {
+                    let prompt = if prompt.is_empty() {
+                        "Describe this image.".to_string()
+                    } else {
+                        prompt.to_string()
+                    };
+                    self.submit_initial_with_images(prompt, vec![image]);
+                }
+                Err(error) => self.notice(format!("could not attach image: {error}")),
+            }
+            return;
+        }
+
         // `!cmd` runs in the shell directly; the output lands in the
         // transcript and in history, so the model sees what the user did.
         if let Some(cmd) = trimmed.strip_prefix('!').map(str::trim) {
@@ -1378,6 +1400,11 @@ impl App {
                             let _ = results.send(AppJob::Rename { name, epoch }).await;
                         }
                     });
+                } else if is_literal_slash_prompt(&trimmed) {
+                    // Absolute paths and a literal leading slash are prompt
+                    // text, not misspelled commands. This is how screenshot
+                    // clipboard tools hand e `/var/.../capture.png question`.
+                    self.prompt(trimmed);
                 } else {
                     self.notice(format!("unknown command {trimmed}"));
                 }
@@ -1818,6 +1845,35 @@ fn command_arg<'a>(input: &'a str, command: &str) -> Option<&'a str> {
     input
         .strip_prefix(command)
         .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// A screenshot tool commonly pastes an absolute temporary path followed by
+/// the user's prompt. Return the existing image prefix and the text after it.
+/// Checking extension boundaries from left to right also handles spaces in the
+/// filename without requiring shell quoting.
+fn leading_image_prompt(input: &str) -> Option<(&str, &str)> {
+    let lower = input.to_ascii_lowercase();
+    for extension in [".png", ".jpg", ".jpeg", ".gif", ".webp"] {
+        let mut from = 0;
+        while let Some(relative) = lower[from..].find(extension) {
+            let end = from + relative + extension.len();
+            let boundary = input[end..].chars().next().is_none_or(char::is_whitespace);
+            if boundary && std::path::Path::new(&input[..end]).is_file() {
+                return Some((&input[..end], input[end..].trim_start()));
+            }
+            from = end;
+        }
+    }
+    None
+}
+
+fn is_literal_slash_prompt(input: &str) -> bool {
+    input == "/"
+        || input.starts_with("/ ")
+        || input
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token[1..].contains('/'))
 }
 
 /// Decide whether a command-line prompt may start now or must wait for the
@@ -3160,6 +3216,22 @@ mod tests {
             Some(1),
             "the image must still be attached to its own text, not lost or moved"
         );
+    }
+
+    #[test]
+    fn screenshot_paths_at_the_start_of_a_prompt_are_split_from_the_question() {
+        let dir = std::env::temp_dir().join(format!("e-shot-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Shotbase Capture.png");
+        std::fs::write(&path, b"png").unwrap();
+        let input = format!("{} what is wrong here?", path.display());
+        let (found, prompt) = leading_image_prompt(&input).expect("image prefix is recognized");
+        assert_eq!(std::path::Path::new(found), path);
+        assert_eq!(prompt, "what is wrong here?");
+        assert!(is_literal_slash_prompt(&input));
+        assert!(is_literal_slash_prompt("/ explain this"));
+        assert!(!is_literal_slash_prompt("/modles please"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

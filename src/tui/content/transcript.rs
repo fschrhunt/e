@@ -294,10 +294,9 @@ impl Block {
             .rposition(|child| child.state == ToolState::Running)
     }
 
-    /// The transient rows for the focused running child: its status row —
-    /// `└` continuing a tree, `●` for a lone call — with a steady accent
-    /// marker (the activity dot below is the one blinker; a flickering
-    /// tree connector reads as a glitch), and its live output beneath.
+    /// The transient rows for the focused running child: its status row,
+    /// `└` continuing a tree or `●` for a lone call, all in the tree's muted
+    /// gray, with its live output beneath.
     pub fn overlay_rows(&self, theme: &Theme, width: usize) -> Vec<String> {
         let Some(index) = self.focused_running() else {
             return Vec::new();
@@ -308,7 +307,7 @@ impl Block {
         } else {
             "└"
         };
-        let marker = theme.fg("accent", marker);
+        let marker = theme.fg("muted", marker);
         let available = width.saturating_sub(2 + display_width(&child.running));
         let target = clip_plain(&child.target, available);
         let label = if target.is_empty() {
@@ -336,7 +335,7 @@ impl Block {
                 .map(|row| (row, None))
                 .collect();
         }
-        let marker = theme.fg("userMessageText", "●");
+        let marker = theme.fg("muted", "●");
         let header = clip_plain(&self.text, width.saturating_sub(2));
         let mut rows = vec![(format!("{marker} {}", theme.fg("muted", &header)), None)];
         for (index, child) in self.tool_children.iter().enumerate() {
@@ -485,11 +484,9 @@ impl Block {
                 rows
             }
             Kind::ToolGroup => {
-                // The reference grammar runs the tool family flush left — the
-                // same column as the user rail — never indented. The header's
-                // `●` wears the prompt-rail ink, unbolded, and the tallies the
-                // statusline gray, clipped to the frame.
-                let marker = theme.fg("userMessageText", "●");
+                // The tool family runs flush left at the user rail's column.
+                // Marker, tallies, branches, and rows share one muted gray.
+                let marker = theme.fg("muted", "●");
                 let header = clip_plain(&self.text, width.saturating_sub(2));
                 let mut rows = vec![format!("{marker} {}", theme.fg("muted", &header))];
                 if self.tool_children.is_empty() {
@@ -695,20 +692,14 @@ fn diff_stat_suffix(theme: &Theme, result: &str) -> String {
             dels = Some(n);
         }
     }
-    let add_token = Theme::diff_marker_token(true);
-    let del_token = Theme::diff_marker_token(false);
-    match (adds, dels) {
-        (Some(a), Some(d)) if a > 0 && d > 0 => format!(
-            " {} {} {}",
-            theme.fg(add_token, &format!("+{a}")),
-            theme.fg("dim", "/"),
-            theme.fg(del_token, &format!("-{d}"))
-        ),
-        (Some(a), _) if a > 0 => format!(" {}", theme.fg(add_token, &format!("+{a}"))),
-        (_, Some(d)) if d > 0 => format!(" {}", theme.fg(del_token, &format!("-{d}"))),
-        (Some(_), Some(_)) => String::new(),
-        _ => format!(" {}", theme.fg("muted", result)),
-    }
+    let plain = match (adds, dels) {
+        (Some(a), Some(d)) if a > 0 && d > 0 => format!("+{a} / -{d}"),
+        (Some(a), _) if a > 0 => format!("+{a}"),
+        (_, Some(d)) if d > 0 => format!("-{d}"),
+        (Some(_), Some(_)) => return String::new(),
+        _ => result.to_string(),
+    };
+    format!(" {}", theme.fg("muted", &plain))
 }
 
 /// Visible width of a styled suffix (SGR stripped).
@@ -734,19 +725,12 @@ fn suffix_stat_width(suffix: &str) -> usize {
 /// ctrl+o, never inline. Live rows are a shell thing: a write or edit shows
 /// in the tree as its one action row, never as the file's content streaming
 /// beneath it.
-/// One child's status row — the single grammar the live tree and the
-/// review screen both speak: state-toned connector, the reference's verb
-/// per state (a non-zero exit stays on its `Ran` row), the failure reason
-/// on the target, the edit/write stat suffix.
+/// One child's status row, shared by the live tree and review screen: muted
+/// connector, state-specific verb, failure reason, and edit/write stat suffix.
 fn child_row(theme: &Theme, width: usize, child: &ToolChild, connector: &str) -> String {
-    let connector = match child.state {
-        ToolState::Running => theme.fg("dim", connector),
-        ToolState::Failed | ToolState::TimedOut | ToolState::Blocked => {
-            theme.fg("error", connector)
-        }
-        ToolState::Cancelled => theme.fg("warning", connector),
-        _ => theme.fg("muted", connector),
-    };
+    // A tool tree is one muted work log. State belongs in the verb and result,
+    // not in bright connectors that make random branches look selected.
+    let connector = theme.fg("muted", connector);
     let action = match child.state {
         ToolState::Pending | ToolState::Running => child.running.as_str(),
         ToolState::Completed => child.completed.as_str(),
@@ -1050,6 +1034,50 @@ mod tests {
         block.finish_tool(1, ToolOutcome::Completed, "done".into(), "");
         assert_eq!(block.focused_running(), None);
         assert!(block.overlay_rows(&theme, 80).is_empty());
+    }
+
+    #[test]
+    fn tool_tree_uses_one_muted_color_for_every_state() {
+        let theme = Theme::from_json(
+            r#"{"vars":{"m":240,"a":250,"e":196,"d":34},"colors":{"muted":"m","dim":"m","accent":"a","error":"e","diffAdd":"d","diffRemove":"e"}}"#,
+        )
+        .unwrap();
+        let mut block = Block::tool_group(vec![
+            ToolChild::pending(
+                1,
+                "edit".into(),
+                "Editing".into(),
+                "Edited".into(),
+                "a.rs".into(),
+            ),
+            ToolChild::pending(
+                2,
+                "read".into(),
+                "Reading".into(),
+                "Read".into(),
+                "missing.rs".into(),
+            ),
+        ]);
+        block.start_tool(1);
+        assert!(block
+            .overlay_rows(&theme, 80)
+            .iter()
+            .all(|row| !row.contains(theme.fg_prefix("accent"))));
+        block.finish_tool(1, ToolOutcome::Completed, "+2 -1".into(), "");
+        block.finish_tool(2, ToolOutcome::Failed, "not found".into(), "");
+        block.seal();
+        let rows = block.lines_for_test(&theme, 80);
+        for token in ["accent", "error", "diffAdd", "diffRemove"] {
+            assert!(
+                rows.iter().all(|row| !row.contains(theme.fg_prefix(token))),
+                "tool tree unexpectedly used {token}: {rows:?}"
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| row.contains(theme.fg_prefix("muted"))),
+            "every tool row stays muted"
+        );
     }
 
     /// Thinking renders its full streamed text in thinkingText, one wrapped
