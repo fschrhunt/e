@@ -81,17 +81,17 @@ the pipeline publishes.
   streaming minutes of invisible thinking no longer balloons ↓ into a
   number nothing on screen can explain.
 
-- Streamed thinking is shown by default (`show_thinking: on`), so a long
-  thinking phase reads as thinking rather than as a hung stream. Set it
-  back to `off` for the old quiet behavior.
+- Provider reasoning stays internal and no longer creates transcript rows.
+  Only actual text deltas render as the model's white voice, including text
+  sent before a tool call and the final answer after tools finish.
 
 - The completions dialect now sends `reasoning_effort` for models that
   declare an effort knob — the one wire dialect that silently dropped it.
 - A preference pass — five deliberate departures from the reference where
   its choices didn't earn their keep here:
-  - The statusline slims back to just the model (accent-bright) and the
-    context percent, muted — the extra segments (sign-in nudge, queue
-    counts, effort, session title, `Context: 12k/200k`, workspace tail and
+  - The statusline shows the model and its selected effort as one persistent
+    identity, followed by the muted context percent. The extra segments
+    (sign-in nudge, queue counts, session title, `Context: 12k/200k`, workspace tail and
     git branch) are gone.
   - The activity row's text wears one tone — verb, elapsed, and token
     tail all dim, no second color for the counts — beside the accent

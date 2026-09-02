@@ -39,12 +39,6 @@ struct ActiveTurn {
     /// The current assistant text block, if one is streaming.
     block: Option<usize>,
     text: String,
-    /// The live thinking block for the current burst, if reasoning has
-    /// streamed. Ending a burst detaches this so the next reasoning opens a
-    /// fresh block; the finished thought stays expanded in place — this index
-    /// is only the open segment.
-    thinking_block: Option<usize>,
-    thinking: String,
     turn: Turn,
     started: Instant,
     error: Option<String>,
@@ -221,10 +215,6 @@ struct App {
     auth: Option<AuthStage>,
     /// The settings panel, when /settings is active.
     settings: Option<crate::tui::settingspanel::SettingsPanel>,
-    /// Whether streamed thinking is drawn (the `show_thinking` setting,
-    /// default off). Gating only the drawing — the ↓ token estimate always
-    /// counts reasoning.
-    show_thinking: bool,
     /// Background job narration (login flows) into the transcript.
     jobs: tokio::sync::mpsc::Sender<String>,
     /// How a login flow ended; control flow reads this, never the notices.
@@ -2191,8 +2181,6 @@ pub async fn run(
         menu: None,
         auth: None,
         settings: None,
-        show_thinking: crate::core::config::settings::get_string("show_thinking").as_deref()
-            != Some("off"),
         jobs: jobs_tx,
         logins: logins_tx,
         login_task: None,
@@ -2417,18 +2405,10 @@ pub async fn run(
                             } else if changing_effort {
                                 app.agent.use_saved_effort();
                             }
-                            // A theme change applies immediately; settings can
-                            // also change what the statusline derives from disk.
-                            // The thinking toggle and keymap are file-backed
-                            // too — re-read them so a mid-session change
-                            // lands this frame.
+                            // Theme and keymap changes apply immediately;
+                            // settings can also change statusline state.
                             app.apply_theme();
                             app.apply_keymap();
-                            app.show_thinking = crate::core::config::settings::get_string(
-                                "show_thinking",
-                            )
-                            .as_deref()
-                            != Some("off");
                             app.refresh_status_cache();
                         } else if let Some(stage) = &mut app.auth {
                             match (&mut *stage, k.code) {
@@ -3288,7 +3268,6 @@ mod tests {
             menu: None,
             auth: None,
             settings: None,
-            show_thinking: true,
             jobs,
             logins,
             login_task: None,
@@ -3494,15 +3473,6 @@ mod tests {
         assert!(app.editor.is_empty());
     }
 
-    fn thinking_flags(app: &App) -> Vec<(String, bool)> {
-        app.transcript
-            .blocks
-            .iter()
-            .filter(|block| block.kind == Kind::Thinking)
-            .map(|block| (block.text.clone(), block.done))
-            .collect()
-    }
-
     #[test]
     fn help_picker_filters_without_a_slash_trigger() {
         let mut app = session_app();
@@ -3561,86 +3531,32 @@ mod tests {
         }
     }
 
-    /// A typical think-then-tools turn opens a second thinking burst below
-    /// the tools. Ending a burst — tools taking over, or TurnEnd — detaches it
-    /// but leaves the thought expanded where it sits: no collapse to a
-    /// `Thought for Ns` row, and never marked done (which would shrink the
-    /// frame and jump the screen).
     #[test]
-    fn thinking_bursts_stay_expanded_at_each_handoff() {
+    fn reasoning_is_hidden_but_text_before_and_after_tools_stays_visible() {
         let mut app = session_app();
         app.on_session_event(SessionEvent::TurnStart);
-        app.on_session_event(SessionEvent::ReasoningDelta("before tools".into()));
-        assert_eq!(thinking_flags(&app), vec![("before tools".into(), false)]);
-
+        app.on_session_event(SessionEvent::ReasoningDelta("**Choosing a tool**".into()));
+        app.on_session_event(SessionEvent::TextDelta("I'll inspect it.".into()));
         app.on_session_event(tool_batch());
-        assert_eq!(
-            thinking_flags(&app),
-            vec![("before tools".into(), false)],
-            "the pre-tool burst stays expanded when tools take over"
-        );
+        app.on_session_event(SessionEvent::ReasoningDelta(
+            "**Writing the answer**".into(),
+        ));
+        app.on_session_event(SessionEvent::TextDelta("Here is the result.".into()));
 
-        app.on_session_event(SessionEvent::ReasoningDelta("after tools".into()));
-        assert_eq!(
-            thinking_flags(&app),
-            vec![
-                ("before tools".into(), false),
-                ("after tools".into(), false)
-            ],
-            "a fresh burst opens its own block below the tools"
+        assert!(
+            app.transcript.blocks.iter().all(|block| {
+                !block.text.contains("Choosing a tool")
+                    && !block.text.contains("Writing the answer")
+            }),
+            "reasoning deltas never become transcript blocks"
         );
-
-        app.on_session_event(SessionEvent::TurnEnd { aborted: false });
-        assert_eq!(
-            thinking_flags(&app),
-            vec![
-                ("before tools".into(), false),
-                ("after tools".into(), false)
-            ],
-            "TurnEnd leaves both thoughts expanded, unchanged"
-        );
-    }
-
-    /// Retries and steered messages also end the live burst; each thought
-    /// keeps its expanded place, and the next burst opens a new block.
-    #[test]
-    fn thinking_stays_expanded_at_retry_and_steer() {
-        let mut app = session_app();
-        app.on_session_event(SessionEvent::TurnStart);
-        app.on_session_event(SessionEvent::ReasoningDelta("attempt one".into()));
-        app.on_session_event(SessionEvent::Retry {
-            attempt: 1,
-            limit: 3,
-            delay_secs: 1,
-            cause: crate::core::providers::FailureCause::Network,
-            reason: "timeout".into(),
-        });
-        assert_eq!(
-            thinking_flags(&app),
-            vec![("attempt one".into(), false)],
-            "the abandoned attempt's thought stays put at the retry"
-        );
-
-        app.on_session_event(SessionEvent::ReasoningDelta("attempt two".into()));
-        app.on_session_event(SessionEvent::Steered("also check this".into()));
-        app.on_session_event(SessionEvent::ReasoningDelta("after steer".into()));
-        assert_eq!(
-            thinking_flags(&app),
-            vec![
-                ("attempt one".into(), false),
-                ("attempt two".into(), false),
-                ("after steer".into(), false)
-            ]
-        );
-
-        app.on_session_event(SessionEvent::TurnEnd { aborted: false });
-        assert_eq!(
-            thinking_flags(&app),
-            vec![
-                ("attempt one".into(), false),
-                ("attempt two".into(), false),
-                ("after steer".into(), false)
-            ]
-        );
+        let replies: Vec<_> = app
+            .transcript
+            .blocks
+            .iter()
+            .filter(|block| block.kind == Kind::Assistant)
+            .map(|block| block.text.as_str())
+            .collect();
+        assert_eq!(replies, ["I'll inspect it.", "Here is the result."]);
     }
 }

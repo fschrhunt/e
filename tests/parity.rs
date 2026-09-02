@@ -625,12 +625,9 @@ fn silent_batches_continue_one_tree_and_long_trees_cap_rows() {
         )
     };
 
-    // Batches with no assistant voice between them continue the same tree;
-    // the collapsed thinking between batches is absorbed, not left to
-    // fragment it.
+    // Batches with no assistant voice between them continue the same tree.
     let mut t = Transcript::default();
     t.extend_tool_group(vec![read(1, "a.rs")]);
-    t.push(Block::new(Kind::Thinking, "Thought for 2s"));
     t.extend_tool_group(vec![read(2, "b.rs")]);
     assert_eq!(t.blocks.len(), 1, "one tree across the silent batch");
     assert_eq!(t.blocks[0].text, "2 tool calls \u{b7} 2 read");
