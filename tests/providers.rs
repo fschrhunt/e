@@ -728,8 +728,9 @@ async fn completions_self_heals_and_remembers_rejected_reasoning_effort() {
     );
     let ok = common::sse_response("data: [DONE]\n\n");
     // conn 0: first attempt (rejected) · conn 1: retry without the field ·
-    // conn 2: a fresh request that must never carry the field again.
-    let (port, server) = common::serve_raw(vec![four_hundred, ok.clone(), ok]);
+    // conn 2: another level still rides the wire · conn 3: the rejected level
+    // is skipped on a later request.
+    let (port, server) = common::serve_raw(vec![four_hundred, ok.clone(), ok.clone(), ok]);
     let home = Home::new("reasoning-heal");
     home.auth(r#"{"reasoning-heal":{"key":"k"}}"#);
     let model = test_model("reasoning-heal", port, Api::Completions);
@@ -742,9 +743,12 @@ async fn completions_self_heals_and_remembers_rejected_reasoning_effort() {
     };
 
     collect_stream(make()).await; // attempt + heal
-    collect_stream(make()).await; // remembered: no reasoning_effort at all
+    let mut low = make();
+    low.effort = Some("low".into());
+    collect_stream(low).await; // a different level remains controllable
+    collect_stream(make()).await; // rejected high is remembered
     let sent = server.join().unwrap();
-    assert_eq!(sent.len(), 3);
+    assert_eq!(sent.len(), 4);
     assert!(
         request_json(&sent[0]).get("reasoning_effort").is_some(),
         "the first attempt sends the declared level"
@@ -753,9 +757,14 @@ async fn completions_self_heals_and_remembers_rejected_reasoning_effort() {
         request_json(&sent[1]).get("reasoning_effort").is_none(),
         "the retry drops the rejected field"
     );
+    assert_eq!(
+        request_json(&sent[2])["reasoning_effort"],
+        "low",
+        "rejecting one level must not disable the model's other levels"
+    );
     assert!(
-        request_json(&sent[2]).get("reasoning_effort").is_none(),
-        "the model is remembered — later requests never re-send it"
+        request_json(&sent[3]).get("reasoning_effort").is_none(),
+        "the rejected model/endpoint/level tuple is remembered"
     );
 }
 
@@ -1555,6 +1564,25 @@ fn models_json_windows_and_overrides() {
 }
 
 #[test]
+fn legacy_efforts_key_remains_accepted() {
+    let _lock = env_lock();
+    let catalog = catalog_with_models_json(
+        r#"{"providers":{"custom":{"base_url":"https://example.invalid","efforts":["low","high"],"models":["one",{"id":"two","efforts":["max"]}]}}}"#,
+    );
+    let effort = |id: &str| {
+        catalog
+            .iter()
+            .find(|model| model.provider == "custom" && model.id == id)
+            .unwrap()
+            .effort
+            .clone()
+    };
+    assert_eq!(effort("one"), ["low", "high"]);
+    // A per-model declaration still wins when both use the legacy spelling.
+    assert_eq!(effort("two"), ["max"]);
+}
+
+#[test]
 fn partial_override_inherits_the_builtin() {
     let _lock = env_lock();
     // One field corrected; transport, window, effort, and thinking stay
@@ -1817,6 +1845,43 @@ async fn provider_reported_models_appear_without_a_release() {
         .any(|m| m.id == "brand-new-model"));
 
     catalog::refresh_remote().await;
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_model_refresh_keeps_the_cached_catalog() {
+    let _lock = env_lock();
+    clear_env_keys();
+    let home = Home::new("stale-model-cache");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    // The listener is dropped, so the refresh gets an immediate connection
+    // refusal. The prior successful result must remain on disk and in catalog().
+    home.auth(r#"{"mock":{"key":"sk-live"}}"#);
+    home.write(
+        "models.json",
+        format!(
+            r#"{{"providers":{{"mock":{{"base_url":"http://127.0.0.1:{port}","models":["seed"]}}}}}}"#
+        ),
+    );
+    let cached =
+        r#"{"mock":{"checked_at":1,"models":[{"id":"cached-model","context_window":64000}]}}"#;
+    home.write("models-store.json", cached);
+
+    catalog::refresh_remote_within(0).await;
+
+    assert_eq!(
+        std::fs::read_to_string(home.dir.join("models-store.json")).unwrap(),
+        cached
+    );
+    let model = catalog::catalog()
+        .into_iter()
+        .find(|model| model.provider == "mock" && model.id == "cached-model")
+        .expect("stale cached model remains available after a failed refresh");
+    assert_eq!(model.context_window, 64_000);
 }
 
 // Google's live list is its own dialect: same `/models` path, but

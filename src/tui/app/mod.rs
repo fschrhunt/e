@@ -1241,6 +1241,34 @@ impl App {
             self.open_scoped_menu();
             return;
         }
+        if let Some(rest) = command_arg(&trimmed, "/effort") {
+            let requested = rest.trim();
+            let levels = self.agent.effort_levels();
+            if levels.is_empty() {
+                self.notice("this model has no reasoning effort control".into());
+            } else if requested.is_empty() {
+                let current = self.agent.effort().unwrap_or_else(|| levels[0].clone());
+                self.notice(format!(
+                    "reasoning effort is {current} · available: {} · use /effort <level>",
+                    levels.join(", ")
+                ));
+            } else if !levels.iter().any(|level| level == requested) {
+                self.notice(format!(
+                    "unsupported reasoning effort {requested:?} · available: {}",
+                    levels.join(", ")
+                ));
+            } else {
+                match self.agent.set_effort(requested) {
+                    Ok(true) => {
+                        self.refresh_status_cache();
+                        self.notice(format!("reasoning effort set to {requested}"));
+                    }
+                    Ok(false) => self.notice("this model has no reasoning effort control".into()),
+                    Err(error) => self.notice(format!("could not save reasoning effort: {error}")),
+                }
+            }
+            return;
+        }
         let model_rest =
             command_arg(&trimmed, "/models").or_else(|| command_arg(&trimmed, "/model"));
         if let Some(rest) = model_rest {
@@ -1803,6 +1831,7 @@ fn is_builtin_command(name: &str) -> bool {
         "login"
             | "models"
             | "model"
+            | "effort"
             | "scoped-models"
             | "reload"
             | "resume"
@@ -1825,7 +1854,7 @@ fn is_builtin_command(name: &str) -> bool {
 fn builtin_category(value: &str) -> &'static str {
     match value {
         "/login" => "Account",
-        "/models" | "/scoped-models" => "Model",
+        "/models" | "/effort" | "/scoped-models" => "Model",
         "/resume" | "/new" | "/tree" | "/compact" => "Session",
         "/trust" => "Workspace",
         _ => "General",
@@ -2075,7 +2104,12 @@ pub async fn run(
     let keymap = crate::core::config::keybindings::load();
 
     let (mut cols, mut rows) = terminal::size()?;
-    let mut painter = Painter::spawn(cols, rows);
+    // The launch anchor: the frame paints below where the user launched e,
+    // never over what came before (the main-screen model mirrors pi's
+    // regular mode). A terminal that doesn't answer DSR 6n — a raw pty —
+    // falls back to the screen's bottom row, the common launch spot.
+    let anchor = crate::tui::paint::background::query_cursor_row(rows).unwrap_or(rows - 1) as usize;
+    let mut painter = Painter::spawn(cols, rows, anchor);
     let (mut agent, mut session_events) = Agent::with_options(model, agent_options.clone());
     let (logins_tx, mut logins_rx) =
         tokio::sync::mpsc::channel::<crate::core::auth::login::Outcome>(4);
@@ -2304,6 +2338,8 @@ pub async fn run(
                             }
                         } else if let Some(panel) = &mut app.settings {
                             let mut setting_error = None;
+                            let changing_effort = panel.selected_key() == Some("effort")
+                                && matches!(k.code, KeyCode::Left | KeyCode::Right);
                             match k.code {
                                 KeyCode::Up => panel.step(-1),
                                 KeyCode::Down => panel.step(1),
@@ -2317,6 +2353,8 @@ pub async fn run(
                             }
                             if let Some(error) = setting_error {
                                 app.notice(format!("could not save setting: {error}"));
+                            } else if changing_effort {
+                                app.agent.use_saved_effort();
                             }
                             // A theme change applies immediately; settings can
                             // also change what the statusline derives from disk.
@@ -2521,7 +2559,10 @@ pub async fn run(
                             // statusline already shows the new level; only a
                             // model without a reasoning knob gets a notice.
                             match app.agent.cycle_effort() {
-                                Ok(Some(_)) => app.refresh_status_cache(),
+                                Ok(Some(effort)) => {
+                                    app.refresh_status_cache();
+                                    app.notice(format!("reasoning effort set to {effort}"));
+                                }
                                 Ok(None) => app.notice("this model has no reasoning effort control".into()),
                                 Err(error) => app.notice(format!("could not save reasoning effort: {error}")),
                             }

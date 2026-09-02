@@ -182,7 +182,7 @@ struct ProviderEntry {
     catalog: Option<crate::core::providers::registry::CatalogStrategy>,
     #[serde(default)]
     responses_mount: Option<crate::core::providers::registry::ResponsesMount>,
-    #[serde(default)]
+    #[serde(default, alias = "efforts")]
     effort: Option<Vec<String>>,
     /// Default window for this provider's models; each model may override.
     #[serde(default)]
@@ -213,7 +213,7 @@ enum ModelEntry {
         id: String,
         #[serde(default)]
         context_window: Option<u64>,
-        #[serde(default)]
+        #[serde(default, alias = "efforts")]
         effort: Vec<String>,
         #[serde(default)]
         thinking: Option<String>,
@@ -386,7 +386,7 @@ pub fn catalog() -> Vec<Model> {
                         provider_image_input,
                         effort: match (&entry.effort, &effort) {
                             // Per-model declaration wins…
-                            (None, e) if !e.is_empty() => e.clone(),
+                            (_, e) if !e.is_empty() => e.clone(),
                             // …then the per-provider default from the file…
                             (Some(e), _) if !e.is_empty() => e.clone(),
                             // …then the built-in's own effort.

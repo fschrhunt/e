@@ -12,29 +12,34 @@ use crate::core::providers::{
     Request, SseStream, StreamEnd, ToolCall,
 };
 
-/// Models that rejected our `reasoning_effort` at least once this run. Effort
-/// levels are declared data (a seed, a `models.json` override), and a
-/// realtime-discovered gateway can accept a set we never see advertised — so
-/// a declared level can be wrong for the actual backend. Rather than hard-fail
-/// on that, the request self-heals (retries without the field) and records the
-/// model here, so we stop paying a failed round-trip for it every step. Keyed
-/// `provider/id`; process-scoped, fail-open (a poisoned lock just re-probes).
+/// Provider/model/level combinations that rejected our `reasoning_effort`
+/// during this run. A backend may reject one level while accepting the rest,
+/// and a custom base URL may reuse a provider and model id, so the full wire
+/// destination and selected value belong in the key. Process-scoped and
+/// fail-open: a poisoned lock merely causes another probe.
 fn reasoning_rejected() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::OnceLock::new();
     SET.get_or_init(Default::default)
 }
 
-fn reasoning_is_rejected(model: &crate::core::providers::catalog::Model) -> bool {
-    let key = format!("{}/{}", model.provider, model.id);
+fn reasoning_key(model: &crate::core::providers::catalog::Model, effort: &str) -> String {
+    format!(
+        "{}\n{}\n{}\n{effort}",
+        model.provider, model.base_url, model.id
+    )
+}
+
+fn reasoning_is_rejected(model: &crate::core::providers::catalog::Model, effort: &str) -> bool {
+    let key = reasoning_key(model, effort);
     reasoning_rejected()
         .lock()
         .map(|set| set.contains(&key))
         .unwrap_or(false)
 }
 
-fn mark_reasoning_rejected(model: &crate::core::providers::catalog::Model) {
-    let key = format!("{}/{}", model.provider, model.id);
+fn mark_reasoning_rejected(model: &crate::core::providers::catalog::Model, effort: &str) {
+    let key = reasoning_key(model, effort);
     if let Ok(mut set) = reasoning_rejected().lock() {
         set.insert(key);
     }
@@ -119,7 +124,7 @@ pub async fn run(
     // it. `off` has no wire encoding here — absence is the closest thing.
     // Skipped for a model already known to reject it (see `reasoning_rejected`).
     if let Some(effort) = request.effort.as_deref().filter(|e| *e != "off") {
-        if !reasoning_is_rejected(&request.model) {
+        if !reasoning_is_rejected(&request.model, effort) {
             body["reasoning_effort"] = json!(effort);
         }
     }
@@ -138,6 +143,15 @@ pub async fn run(
         // provider-specific compatibility table. A rejected request generated
         // no content, so the retry is safe. The body is our own typed object;
         // a non-object can't be repaired, so it falls through to the error.
+        let rejected_effort = request.effort.as_deref().filter(|_| {
+            // Do not treat every mention of "thinking" as an effort failure.
+            // Validation errors about reasoning history or content must reach
+            // the user unchanged. The standard field name is authoritative;
+            // the second phrase is the Go gateway's field-less rejection.
+            lower.contains("reasoning_effort")
+                || lower.contains("thinking cannot be customized")
+                || lower.contains("thinking can't be customized")
+        });
         let repaired = body.as_object_mut().map(|object| {
             let mut changed = false;
             // Usage is useful but not essential; strict OpenAI-compatible
@@ -145,22 +159,19 @@ pub async fn run(
             if lower.contains("stream_options") && object.remove("stream_options").is_some() {
                 changed = true;
             }
-            // The declared effort level is wrong for this backend (an
-            // unadvertised set, a stale override). Drop the knob so the model
-            // runs at its own default instead of hard-failing, and remember so
-            // we stop re-sending it. The error names the field, or — as the Go
-            // gateway does for GLM — says the model's thinking can't be tuned.
-            if object.contains_key("reasoning_effort")
-                && (lower.contains("reasoning") || lower.contains("thinking"))
-            {
-                object.remove("reasoning_effort");
-                mark_reasoning_rejected(&request.model);
+            if rejected_effort.is_some() && object.remove("reasoning_effort").is_some() {
                 changed = true;
             }
             changed
         });
         if repaired == Some(true) {
-            require_success(send(request, authorization, &body).await?).await?
+            let healed = require_success(send(request, authorization, &body).await?).await?;
+            // Remember only after the request without the field succeeds. A
+            // second failure means effort was not the cause of the rejection.
+            if let Some(effort) = rejected_effort {
+                mark_reasoning_rejected(&request.model, effort);
+            }
+            healed
         } else {
             return Err(ProviderError::from_status(status, &text).with_retry_after(retry_after));
         }

@@ -414,9 +414,20 @@ impl Block {
                 // mid-turn and read as a screen jump). Shown only when
                 // `show_thinking` is on.
                 let (color, prefix, pad) = ("thinkingText", "  ", 2);
-                wrap_styled(text, width.saturating_sub(pad).max(8))
+                // Reasoning is markdown too. Rendering it as inert wrapped
+                // text leaked the model's `**` markers into the transcript,
+                // which made internal notes look like malformed reply deltas.
+                // Parse the markup, then tint every resulting row with the
+                // thinking token so it remains distinct from the white reply.
+                render_markdown(theme, text, width.saturating_sub(pad).max(8))
                     .into_iter()
-                    .map(|l| theme.fg(color, &format!("{prefix}{l}")))
+                    .map(|line| {
+                        if line.is_empty() {
+                            line
+                        } else {
+                            theme.fg(color, &format!("{prefix}{line}"))
+                        }
+                    })
                     .collect()
             }
             Kind::Tool => {
@@ -1050,8 +1061,12 @@ mod tests {
             r#"{"vars":{"a":250,"b":240},"colors":{"thinkingText":"a","dim":"b"}}"#,
         )
         .unwrap();
-        let mut block = Block::new(Kind::Thinking, "let me look at this\nstep two");
+        let mut block = Block::new(Kind::Thinking, "**let me look at this**\nstep two");
         let rows = block.lines_for_test(&theme, 40);
+        assert!(
+            rows.iter().all(|row| !row.contains("**")),
+            "thinking markdown markers are rendered, not shown literally"
+        );
         assert!(rows.len() >= 2, "every thought line renders");
         for row in &rows {
             assert!(!row.contains("·"), "thinking carries no dot marker");
