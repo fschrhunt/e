@@ -81,9 +81,10 @@ the pipeline publishes.
   streaming minutes of invisible thinking no longer balloons ↓ into a
   number nothing on screen can explain.
 
-- Provider reasoning stays internal and no longer creates transcript rows.
-  Only actual text deltas render as the model's white voice, including text
-  sent before a tool call and the final answer after tools finish.
+- Provider reasoning is optional transcript content through `show_thinking`,
+  default off. When enabled it stays gray, and streamed `**strong**` markers
+  become styling without ever flashing as literal asterisks. Actual text
+  deltas remain the model's white voice before and after tool calls.
 
 - The completions dialect now sends `reasoning_effort` for models that
   declare an effort knob — the one wire dialect that silently dropped it.

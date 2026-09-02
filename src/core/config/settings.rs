@@ -155,6 +155,17 @@ pub fn all(effort_levels: Vec<String>) -> Vec<Setting> {
             default: "auto".into(),
         },
         Setting {
+            key: "show_thinking".into(),
+            label: "Show thinking".into(),
+            category: "Interface",
+            options: vec!["on".into(), "off".into()],
+            // Off by default: e shows only the reply deltas, and the activity
+            // row's blinking dot and elapsed clock already say a silent
+            // reasoning phase is working, not hung. Readers who want the
+            // model's thinking in the transcript turn it `on`.
+            default: "off".into(),
+        },
+        Setting {
             key: "auto_update".into(),
             label: "Auto-update".into(),
             category: "Updates",

@@ -12,6 +12,8 @@ impl App {
                 self.active = Some(ActiveTurn {
                     block: None,
                     text: String::new(),
+                    thinking_block: None,
+                    thinking: String::new(),
                     turn: Turn::new(),
                     started: Instant::now(),
                     error: None,
@@ -24,13 +26,19 @@ impl App {
             SessionEvent::Steered(text) => {
                 // A mid-turn message: show it as a user turn where it landed.
                 self.transcript.push(Block::new(Kind::User, text));
-                // The next assistant text opens a fresh block.
+                // The next assistant text opens a fresh block; the burst
+                // that was live collapses where it sat.
+                self.end_thinking_burst();
                 if let Some(s) = &mut self.active {
                     s.block = None;
                     s.text.clear();
                 }
             }
             SessionEvent::TextDelta(delta) => {
+                // Reply text starting ends the live thinking burst — the
+                // thought stays expanded above the reply; the next burst,
+                // if any, opens its own block.
+                self.end_thinking_burst();
                 if let Some(s) = &mut self.active {
                     s.turn.phase = TurnPhase::AssistantText;
                     // Model output is untrusted: strip control sequences
@@ -46,10 +54,26 @@ impl App {
                     }
                 }
             }
-            // Provider reasoning remains in the core event/history path for
-            // replay and usage, but it is not transcript content. Only actual
-            // TextDelta events render as the model's white voice.
-            SessionEvent::ReasoningDelta(_) => {}
+            // Reasoning streams live in thinkingText while the burst runs;
+            // when the burst ends — reply text, tools, retry, steer, turn
+            // commit — it collapses to a single dim row. Raw provider text
+            // is stripped before it can reach the paint stream, like
+            // assistant text.
+            SessionEvent::ReasoningDelta(delta) => {
+                if let Some(s) = &mut self.active {
+                    if self.show_thinking {
+                        s.thinking
+                            .push_str(&crate::core::tools::sanitize_display(&delta));
+                        let idx =
+                            open_block(&mut self.transcript, &mut s.thinking_block, Kind::Thinking);
+                        let text = s.thinking.clone();
+                        if let Some(b) = self.transcript.blocks.get_mut(idx) {
+                            b.text = text;
+                            b.touch();
+                        }
+                    }
+                }
+            }
             SessionEvent::ToolCallAssembly { bytes: _ } => {
                 // The model is streaming tool-call arguments. No phase of
                 // its own — the footer stays on Thinking (the model is
@@ -59,8 +83,10 @@ impl App {
                 // usage frames own the numbers.
             }
             SessionEvent::ToolBatchStart { calls } => {
-                // If the agent has not spoken since the last batch, continue
-                // one tree for the whole working stretch.
+                // The pre-batch reasoning burst ends where it sits; the tree
+                // then continues if the agent has not spoken since the last
+                // batch — one tree per working stretch, not one per batch.
+                self.end_thinking_burst();
                 if let Some(s) = &mut self.active {
                     s.block = None;
                     s.text.clear();
@@ -205,6 +231,9 @@ impl App {
                     });
                     s.turn.recovered = None;
                 }
+                // The abandoned attempt's thinking burst ends where it sits;
+                // the retry streams a fresh burst.
+                self.end_thinking_burst();
             }
             SessionEvent::Recovered { attempt, limit } => {
                 if let Some(s) = &mut self.active {
@@ -269,6 +298,11 @@ impl App {
                         }
                     }
                 }
+                // The turn's final burst ends with it — same moment, not
+                // early. Every other burst end (reply text, tools, retry,
+                // steer) ended where it happened; this catches the one that
+                // ran to the turn's end.
+                self.end_thinking_burst();
                 let Some(s) = self.active.take() else { return };
                 // The reference grammar: a completed turn ends with a dim
                 // duration-and-tokens row; a cancelled one says so instead —
@@ -334,7 +368,9 @@ impl App {
     }
 }
 
-/// The currently open assistant block, or a freshly started one.
+/// The currently open block for `index`, or a freshly started one — the
+/// same shape `TextDelta`'s assistant block and `ReasoningDelta`'s thinking
+/// block both need, each with a different `kind`.
 fn open_block(transcript: &mut Transcript, index: &mut Option<usize>, kind: Kind) -> usize {
     match *index {
         Some(idx) => idx,
@@ -343,5 +379,20 @@ fn open_block(transcript: &mut Transcript, index: &mut Option<usize>, kind: Kind
             *index = Some(idx);
             idx
         }
+    }
+}
+
+/// End the live thinking burst: detach it so the next reasoning opens a
+/// fresh block. The streamed thought stays where it sits, expanded, in
+/// `thinkingText` — there is no collapse to a dim `Thought for Ns` summary.
+/// That collapse shrank the frame mid-turn, and because the paint window
+/// tracks the transcript's tail, a shrink after the burst had scrolled into
+/// scrollback read as the whole screen jumping. A no-op with no burst open —
+/// in particular when `show_thinking` is off, which never opens one.
+impl App {
+    pub(super) fn end_thinking_burst(&mut self) {
+        let Some(s) = &mut self.active else { return };
+        s.thinking_block = None;
+        s.thinking.clear();
     }
 }

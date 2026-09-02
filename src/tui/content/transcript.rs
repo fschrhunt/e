@@ -62,6 +62,10 @@ pub enum Kind {
     Banner,
     User,
     Assistant,
+    /// One assistant turn's streamed thinking — drawn live while the burst
+    /// runs, then collapsed to a single dim `Thought for Ns` row when the
+    /// burst ends (reply text, tools, retry, steer, turn commit).
+    Thinking,
     Tool,
     /// One provider-issued batch: a tallied header over stable lifecycle
     /// children, including a single call in minimal mode.
@@ -398,6 +402,29 @@ impl Block {
                     .map(|l| if l.is_empty() { l } else { format!("  {l}") })
                     .collect()
             }
+            Kind::Thinking => {
+                let text = self.text.trim();
+                if text.is_empty() {
+                    return Vec::new();
+                }
+                // Reasoning needs a stable streaming renderer. A general
+                // markdown parser exposes an opening `**` until the closing
+                // marker arrives, then reparses and shifts the live frame.
+                // Treat strong markers as styling even while unmatched, and
+                // leave every other character inert. The whole row remains in
+                // thinkingText, distinct from white assistant TextDelta rows.
+                let styled = reasoning_style(text);
+                wrap_styled(&styled, width.saturating_sub(2).max(8))
+                    .into_iter()
+                    .map(|line| {
+                        if line.is_empty() {
+                            line
+                        } else {
+                            theme.fg("thinkingText", &format!("  {line}"))
+                        }
+                    })
+                    .collect()
+            }
             Kind::Tool => {
                 // The reference shape: a finished row is just the row — no
                 // "(done)". Failure turns the marker to the error token and
@@ -542,6 +569,26 @@ impl Block {
             ),
         }
     }
+}
+
+/// Render `**strong**` reasoning without ever exposing a partial marker.
+/// An unmatched opener styles the text received so far; when its closer
+/// arrives the visible cells do not change, so streaming cannot reflow merely
+/// because markdown became complete.
+fn reasoning_style(text: &str) -> String {
+    let mut out = String::new();
+    let mut strong = false;
+    for (index, part) in text.split("**").enumerate() {
+        if index > 0 {
+            strong = !strong;
+        }
+        if strong {
+            out.push_str(&bold(part));
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
 }
 
 fn category_tally(category: &str, count: usize) -> String {
@@ -889,18 +936,30 @@ impl Transcript {
         self.blocks = out;
     }
 
-    /// The tree a new batch should continue. Assistant text, the user,
-    /// notices, and errors all separate trees.
+    /// The tree a new batch should continue: the last block, walking back
+    /// over collapsed thinking summaries, when it is a live tool group.
+    /// Assistant text, the user, notices, and errors all separate trees.
     fn open_tool_group(&self) -> Option<usize> {
-        self.blocks
-            .last()
-            .filter(|block| block.kind == Kind::ToolGroup && !block.done)
-            .map(|_| self.blocks.len() - 1)
+        for (index, block) in self.blocks.iter().enumerate().rev() {
+            match block.kind {
+                Kind::Thinking => continue,
+                Kind::ToolGroup if !block.done => return Some(index),
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Continue the open tool tree with a new batch, or start one. Batches
-    /// with no assistant voice between them form one growing tree.
+    /// with no assistant voice between them — only collapsed thinking, whose
+    /// summary rows the merge absorbs — are one tree, so a silently
+    /// tool-chaining agent reads as a single growing tree.
     pub fn extend_tool_group(&mut self, children: Vec<ToolChild>) -> usize {
+        if let Some(idx) = self.open_tool_group() {
+            // Everything after the group is absorbed thinking: drop it so
+            // the continued rows sit directly under their tree.
+            self.blocks.truncate(idx + 1);
+        }
         let idx = self
             .open_tool_group()
             .unwrap_or_else(|| self.push(Block::tool_group(Vec::new())));
@@ -1037,6 +1096,46 @@ mod tests {
         );
     }
 
+    /// Thinking renders its full streamed text in thinkingText, one wrapped
+    /// row per line, with no `·` marker and no collapse to a summary — ending
+    /// a burst leaves the thought expanded where it sits.
+    #[test]
+    fn thinking_renders_expanded_in_thinking_text_without_collapse() {
+        let theme = Theme::from_json(
+            r#"{"vars":{"a":250,"b":240},"colors":{"thinkingText":"a","dim":"b"}}"#,
+        )
+        .unwrap();
+        let mut block = Block::new(Kind::Thinking, "**let me look");
+        let partial = block.lines_for_test(&theme, 40);
+        assert!(
+            partial.iter().all(|row| !row.contains("**")),
+            "an unmatched streaming marker must never become visible"
+        );
+        block.text = "**let me look at this**\nstep two".into();
+        block.touch();
+        let rows = block.lines_for_test(&theme, 40);
+        assert!(
+            rows.iter().all(|row| !row.contains("**")),
+            "complete thinking markers are rendered, not shown literally"
+        );
+        assert!(rows.len() >= 2, "every thought line renders");
+        for row in &rows {
+            assert!(!row.contains("·"), "thinking carries no dot marker");
+            assert!(
+                row.contains(theme.fg_prefix("thinkingText")),
+                "thinking wears thinkingText, never the dim summary color"
+            );
+        }
+        // A finished burst is never rewritten to a one-line summary: growing
+        // the text keeps growing the rendered rows.
+        block.text = "let me look at this\nstep two\nand a third".into();
+        block.touch();
+        assert!(
+            block.lines_for_test(&theme, 40).len() >= 3,
+            "the thought stays expanded, not collapsed to one row"
+        );
+    }
+
     #[test]
     fn failed_tool_summary_is_sanitized_before_rendering() {
         let mut block = Block::tool_group(vec![ToolChild::pending(
@@ -1054,6 +1153,21 @@ mod tests {
         );
         assert_eq!(block.tool_children[0].result.as_deref(), Some("bad reason"));
         for row in block.lines_for_test(&theme(), 80) {
+            assert!(
+                !row.contains("\x1b[2J"),
+                "an erase sequence leaked: {row:?}"
+            );
+            assert!(!row.contains("\x1b]"), "an OSC sequence leaked: {row:?}");
+        }
+    }
+
+    /// Block text stays inert even for the thinking surface.
+    #[test]
+    fn thinking_text_is_sanitized() {
+        let theme = theme();
+        let block = Block::new(Kind::Thinking, "ho \x1b[2Jho and \x1b]52;c;x\x07 tail");
+        for row in block.lines_for_test(&theme, 40) {
+            // The theme's own styling escapes remain; the injected ones go.
             assert!(
                 !row.contains("\x1b[2J"),
                 "an erase sequence leaked: {row:?}"
